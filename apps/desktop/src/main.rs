@@ -13,125 +13,276 @@ use voice_protocol::{ClientMessage, ServerMessage, SignalPayload};
 
 slint::slint! {
     import { Button, LineEdit, ComboBox, Slider, ScrollView } from "std-widgets.slint";
+
     export struct PeerMixRow {
         id: string,
         name: string,
         volume: float,
     }
+
     export component MainWindow inherits Window {
-        title: "Voice Screen - Voz e Volume";
-        width: 730px;
-        height: 880px;
+        title: "Voice Screen - Salas de voz";
+        width: 1060px;
+        height: 720px;
+        background: #f3f5f9;
+
+        // As propriedades e callbacks originais foram mantidos para preservar o Rust.
         in-out property <string> server-url: "wss://voz.virtuabil.cloud/ws";
         in-out property <string> display-name: "Participante";
         in-out property <string> room-code: "";
         in-out property <string> status-text: "Pronto para criar ou entrar em uma sala";
         in-out property <string> participants-text: "Nenhum participante conectado";
-        in-out property <string> p2p-text: "O teste P2P iniciara quando um segundo participante entrar.";
-        callback create-room();
-        callback join-room();
+        in-out property <string> p2p-text: "Aguardando conexao WebRTC";
         in-out property <bool> microphone-enabled: false;
-        callback toggle-microphone();
         in-out property <[string]> microphone-list: ["Padrao do Windows"];
         in-out property <int> microphone-index: 0;
-        in-out property <string> microphone-meter: "Microfone: desligado";
-        callback select-microphone(int);
-        callback refresh-microphones();
+        in-out property <string> microphone-meter: "Microfone desligado";
         in-out property <[string]> output-list: ["Padrao do Windows"];
         in-out property <int> output-index: 0;
+        in-out property <float> master-volume: 100;
+        in-out property <[PeerMixRow]> peer-volumes: [];
+        in-out property <string> audio-stats-text: "Aguardando participantes para iniciar a voz";
+        in-out property <int> active-section: 0;
+
+        callback create-room();
+        callback join-room();
+        callback toggle-microphone();
+        callback select-microphone(int);
+        callback refresh-microphones();
+        callback test-speaker();
         callback select-output(int);
         callback refresh-outputs();
-        in-out property <float> master-volume: 100;
         callback change-master-volume(float);
-        in-out property <[PeerMixRow]> peer-volumes: [];
         callback change-peer-volume(string, float);
-        in-out property <string> audio-stats-text: "Aguardando participantes para iniciar o canal de voz.";
-        callback test-speaker();
-        ScrollView {
+
         VerticalLayout {
-            padding: 20px;
-            spacing: 10px;
-            Text { text: "Voice Screen"; font-size: 26px; font-weight: 700; }
-            Text { text: "Servidor de sinalizacao:"; }
-            LineEdit { text <=> root.server-url; }
-            Text { text: "Seu nome:"; }
-            LineEdit { text <=> root.display-name; }
-            Text { text: "Codigo da sala:"; }
-            LineEdit { text <=> root.room-code; }
-            HorizontalLayout {
-                spacing: 12px;
-                Button { text: "Criar sala"; clicked => { root.create-room(); } }
-                Button { text: "Entrar na sala"; clicked => { root.join-room(); } }
-            }
-            Text { text: "Microfone de entrada:"; font-weight: 700; }
-            HorizontalLayout {
-                spacing: 8px;
-                microphone_selector := ComboBox {
-                    model: root.microphone-list;
-                    current-index: root.microphone-index;
-                    selected(_value) => { root.select-microphone(microphone_selector.current-index); }
-                }
-                Button { text: "Atualizar"; clicked => { root.refresh-microphones(); } }
-            }
-            HorizontalLayout {
-                spacing: 10px;
-                Button {
-                    text: root.microphone-enabled ? "Desligar microfone" : "Ligar microfone";
-                    clicked => { root.toggle-microphone(); }
-                }
-                Button { text: "Testar saida"; clicked => { root.test-speaker(); } }
-            }
-            Text { text: root.microphone-meter; color: #175cd3; }
-            Text { text: "Dispositivo de saida:"; font-weight: 700; }
-            HorizontalLayout {
-                spacing: 8px;
-                output_selector := ComboBox {
-                    model: root.output-list;
-                    current-index: root.output-index;
-                    selected(_value) => { root.select-output(output_selector.current-index); }
-                }
-                Button { text: "Atualizar"; clicked => { root.refresh-outputs(); } }
-            }
-            Text { text: "Volume geral de saida (0 a 200%):"; font-weight: 700; }
-            HorizontalLayout {
-                spacing: 8px;
-                Slider {
-                    minimum: 0; maximum: 200; step: 5;
-                    value <=> root.master-volume;
-                    changed(value) => { root.change-master-volume(value); }
-                }
-                Text { text: root.master-volume + "%"; width: 65px; }
-            }
-            Text { text: "Volume individual de cada participante:"; font-weight: 700; }
-            for peer in root.peer-volumes : HorizontalLayout {
-                spacing: 8px;
-                Text { text: peer.name; width: 155px; }
-                Slider {
-                    minimum: 0; maximum: 200; step: 5;
-                    value: peer.volume;
-                    changed(value) => { root.change-peer-volume(peer.id, value); }
-                }
-                Text { text: peer.volume + "%"; width: 65px; }
-            }
-            Text { text: "Pacotes de audio por participante:"; font-weight: 700; }
-            Text { text: root.audio-stats-text; wrap: word-wrap; color: #175cd3; }
-            Text { text: root.status-text; wrap: word-wrap; }
-            Text { text: root.participants-text; wrap: word-wrap; }
-            Text { text: "Eventos P2P:"; font-weight: 700; }
+            spacing: 0px;
+
+            // Cabecalho simples: principal primeiro, configuracoes fora do caminho.
             Rectangle {
-                background: #f2f4f7;
-                border-radius: 8px;
-                VerticalLayout {
-                    padding: 12px;
-                    Text { text: root.p2p-text; wrap: word-wrap; color: #344054; }
+                height: 76px;
+                background: #152238;
+                HorizontalLayout {
+                    padding-left: 24px;
+                    padding-right: 24px;
+                    padding-top: 12px;
+                    padding-bottom: 12px;
+                    spacing: 12px;
+                    VerticalLayout {
+                        spacing: 2px;
+                        Text { text: "Voice Screen"; font-size: 24px; font-weight: 700; color: #ffffff; }
+                        Text { text: "Chamadas de voz entre computadores"; font-size: 12px; color: #bdc8d9; }
+                    }
+                    Rectangle { background: transparent; horizontal-stretch: 1; }
+                    Button { text: "Chamada"; clicked => { root.active-section = 0; } }
+                    Button { text: "Dispositivos"; clicked => { root.active-section = 1; } }
+                    Button { text: "Diagnostico"; clicked => { root.active-section = 2; } }
                 }
             }
-            Text {
-                text: "Se 'enviados' aumenta mas 'recebidos' e zero no outro PC, verificar canal P2P. Se 'recebidos' aumenta sem som, verificar saida e volumes. Use fones para evitar eco.";
-                wrap: word-wrap;
-                color: #667085;
+
+            // Conteudo: coluna de sala/participantes e painel principal independente.
+            HorizontalLayout {
+                padding: 16px;
+                spacing: 16px;
+
+                Rectangle {
+                    width: 290px;
+                    background: #ffffff;
+                    border-radius: 14px;
+                    border-width: 1px;
+                    border-color: #e2e7ef;
+                    VerticalLayout {
+                        padding: 18px;
+                        spacing: 10px;
+
+                        Text { text: "SUA SALA"; font-size: 13px; font-weight: 700; color: #506581; }
+                        Text { text: "Nome"; font-size: 12px; color: #667891; }
+                        LineEdit { text <=> root.display-name; }
+                        Text { text: "Codigo de convite"; font-size: 12px; color: #667891; }
+                        LineEdit { text <=> root.room-code; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button { text: "Criar sala"; clicked => { root.create-room(); } }
+                            Button { text: "Entrar"; clicked => { root.join-room(); } }
+                        }
+                        Rectangle { height: 1px; background: #e6eaf0; }
+                        Text { text: "PARTICIPANTES"; font-size: 13px; font-weight: 700; color: #506581; }
+                        Text {
+                            text: root.participants-text;
+                            font-size: 12px;
+                            color: #75849b;
+                            wrap: word-wrap;
+                        }
+
+                        // So a lista rola; acoes de sala permanecem visiveis.
+                        ScrollView {
+                            VerticalLayout {
+                                spacing: 9px;
+                                for peer in root.peer-volumes : Rectangle {
+                                    height: 96px;
+                                    background: #f5f7fb;
+                                    border-radius: 10px;
+                                    VerticalLayout {
+                                        padding: 10px;
+                                        spacing: 3px;
+                                        HorizontalLayout {
+                                            spacing: 5px;
+                                            Text {
+                                                text: peer.name;
+                                                font-size: 13px;
+                                                color: rgb(38, 55, 78);
+                                                font-weight: 600;
+                                                horizontal-stretch: 1;
+                                            }
+                                            Text { text: peer.volume + "%"; font-size: 12px; color: #506581; }
+                                        }
+                                        Slider {
+                                            minimum: 0;
+                                            maximum: 200;
+                                            step: 5;
+                                            value: peer.volume;
+                                            changed(value) => { root.change-peer-volume(peer.id, value); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    background: #ffffff;
+                    border-radius: 14px;
+                    border-width: 1px;
+                    border-color: #e2e7ef;
+                    horizontal-stretch: 1;
+                    VerticalLayout {
+                        spacing: 0px;
+
+                        // Tela principal: somente o que importa durante a chamada.
+                        if root.active-section == 0 : VerticalLayout {
+                            padding: 28px;
+                            spacing: 18px;
+                            Text { text: "Chamada de voz"; font-size: 25px; color: #223450; font-weight: 700; }
+                            Text { text: "Acompanhe a sala e controle seu microfone pela barra inferior."; color: #75849b; font-size: 14px; }
+                            Rectangle {
+                                height: 120px;
+                                background: #f2f7ff;
+                                border-radius: 12px;
+                                VerticalLayout {
+                                    padding: 18px;
+                                    spacing: 8px;
+                                    Text { text: "Estado da conexao"; color: #5072a6; font-size: 13px; font-weight: 700; }
+                                    Text { text: root.status-text; color: #264a76; font-size: 16px; wrap: word-wrap; }
+                                }
+                            }
+                            Rectangle {
+                                height: 110px;
+                                background: #f8fafc;
+                                border-radius: 12px;
+                                VerticalLayout {
+                                    padding: 18px;
+                                    spacing: 10px;
+                                    Text { text: "Microfone"; font-size: 14px; font-weight: 700; color: rgb(48, 70, 94); }
+                                    Text { text: root.microphone-meter; color: #175cd3; font-size: 15px; wrap: word-wrap; }
+                                }
+                            }
+                            Rectangle { background: transparent; vertical-stretch: 1; }
+                            Text {
+                                text: "Use fones de ouvido para evitar eco durante os testes.";
+                                font-size: 12px;
+                                color: #8a98a9;
+                            }
+                        }
+
+                        // Configuracoes agrupadas: nao ocupam espaco na chamada.
+                        if root.active-section == 1 : ScrollView {
+                            VerticalLayout {
+                                padding: 28px;
+                                spacing: 14px;
+                                Text { text: "Dispositivos e audio"; font-size: 24px; font-weight: 700; color: #223450; }
+                                Text { text: "Escolha o microfone e onde deseja ouvir os participantes."; font-size: 14px; color: #75849b; }
+                                Rectangle { height: 1px; background: #e6eaf0; }
+                                Text { text: "Microfone de entrada"; font-size: 14px; font-weight: 700; color: rgb(49, 70, 94); }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    mic_selector := ComboBox {
+                                        model: root.microphone-list;
+                                        current-index: root.microphone-index;
+                                        selected(_value) => { root.select-microphone(mic_selector.current-index); }
+                                    }
+                                    Button { text: "Atualizar"; clicked => { root.refresh-microphones(); } }
+                                }
+                                Text { text: "Dispositivo de saida"; font-size: 14px; font-weight: 700; color: rgb(49, 70, 94); }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    output_selector := ComboBox {
+                                        model: root.output-list;
+                                        current-index: root.output-index;
+                                        selected(_value) => { root.select-output(output_selector.current-index); }
+                                    }
+                                    Button { text: "Atualizar"; clicked => { root.refresh-outputs(); } }
+                                }
+                                Rectangle { height: 1px; background: #e6eaf0; }
+                                Text { text: "Volume geral de saida"; font-size: 14px; font-weight: 700; color: rgb(49, 70, 94); }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    Slider {
+                                        minimum: 0;
+                                        maximum: 200;
+                                        step: 5;
+                                        value <=> root.master-volume;
+                                        changed(value) => { root.change-master-volume(value); }
+                                    }
+                                    Text { text: root.master-volume + "%"; width: 70px; color: #506581; }
+                                }
+                                Text { text: "O volume de cada pessoa pode ser ajustado na coluna Participantes."; font-size: 12px; color: #75849b; wrap: word-wrap; }
+                                Rectangle { background: transparent; vertical-stretch: 1; }
+                            }
+                        }
+
+                        // Logs ficam numa aba separada, sem poluir a experiencia.
+                        if root.active-section == 2 : ScrollView {
+                            VerticalLayout {
+                                padding: 28px;
+                                spacing: 12px;
+                                Text { text: "Diagnostico da chamada"; font-size: 24px; font-weight: 700; color: #223450; }
+                                Text { text: "Use estes detalhes apenas ao investigar falhas de audio ou conexao."; font-size: 13px; color: #75849b; wrap: word-wrap; }
+                                Rectangle { height: 1px; background: #e6eaf0; }
+                                Text { text: "Pacotes Opus por participante"; font-size: 14px; font-weight: 700; color: rgb(49, 70, 94); }
+                                Text { text: root.audio-stats-text; font-size: 13px; color: #175cd3; wrap: word-wrap; }
+                                Rectangle { height: 1px; background: #e6eaf0; }
+                                Text { text: "Eventos WebRTC"; font-size: 14px; font-weight: 700; color: rgb(49, 70, 94); }
+                                Text { text: root.p2p-text; font-size: 12px; color: #53667f; wrap: word-wrap; }
+                                Rectangle { height: 1px; background: #e6eaf0; }
+                                Text { text: "Servidor de sinalizacao"; font-size: 14px; font-weight: 700; color: rgb(49, 70, 94); }
+                                LineEdit { text <=> root.server-url; }
+                                Text { text: "Alteracoes na URL passam a valer ao criar/entrar na proxima sala."; font-size: 12px; color: #75849b; wrap: word-wrap; }
+                            }
+                        }
+                    }
+                }
             }
-        }
+
+            // A barra de chamada fica sempre visivel, sem rolagem.
+            Rectangle {
+                height: 80px;
+                background: #152238;
+                HorizontalLayout {
+                    padding-left: 24px;
+                    padding-right: 24px;
+                    padding-top: 14px;
+                    padding-bottom: 14px;
+                    spacing: 14px;
+                    Text { text: "Controles da chamada"; color: #c5d0df; font-size: 14px; }
+                    Rectangle { background: transparent; horizontal-stretch: 1; }
+                    Button { text: "Testar saida"; clicked => { root.test-speaker(); } }
+                    Button {
+                        text: root.microphone-enabled ? "Desligar microfone" : "Ligar microfone";
+                        clicked => { root.toggle-microphone(); }
+                    }
+                }
+            }
         }
     }
 }
