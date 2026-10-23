@@ -21,6 +21,8 @@ type AnyError = Box<dyn Error + Send + Sync>;
 #[derive(Debug)]
 pub enum MeshEvent {
     Status(String),
+    MicLevel(f32),
+    VoiceStats { peer: String, sent: u64, received: u64 },
 }
 
 #[derive(Clone)]
@@ -105,6 +107,9 @@ fn start_voice_channel(
             }
         };
         let mut opened = false;
+        let mut packets_sent = 0u64;
+        let mut packets_received = 0u64;
+        let mut reported_send_error = false;
         loop {
             tokio::select! {
                 received = channel.poll() => {
@@ -112,10 +117,26 @@ fn start_voice_channel(
                         Some(DataChannelEvent::OnOpen) => {
                             opened = true;
                             let _ = events.send(MeshEvent::Status(format!("Voz P2P disponivel com {short}")));
+                            let _ = events.send(MeshEvent::VoiceStats {
+                                peer: peer.clone(), sent: packets_sent, received: packets_received,
+                            });
                         }
                         Some(DataChannelEvent::OnMessage(packet)) => {
                             // Somente mensagens binarias do canal dedicado a voz.
-                            decoder.decode(packet.data.as_ref(), &playback, &peer);
+                            match decoder.decode(packet.data.as_ref(), &playback, &peer) {
+                                Ok(Some(_)) => {
+                                    packets_received += 1;
+                                    if packets_received == 1 || packets_received % 50 == 0 {
+                                        let _ = events.send(MeshEvent::VoiceStats {
+                                            peer: peer.clone(), sent: packets_sent, received: packets_received,
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = events.send(MeshEvent::Status(format!("Falha decodificando voz: {e}")));
+                                }
+                                _ => {}
+                            }
                         }
                         Some(DataChannelEvent::OnClose) | None => break,
                         _ => {}
@@ -125,7 +146,24 @@ fn start_voice_channel(
                     match packet {
                         Ok(data) => {
                             // Evitar bloquear a transmissao se o buffer SCTP estiver cheio.
-                            let _ = channel.try_send(BytesMut::from(data.as_slice())).await;
+                            match channel.try_send(BytesMut::from(data.as_slice())).await {
+                                Ok(()) => {
+                                    packets_sent += 1;
+                                    if packets_sent == 1 || packets_sent % 50 == 0 {
+                                        let _ = events.send(MeshEvent::VoiceStats {
+                                            peer: peer.clone(), sent: packets_sent, received: packets_received,
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    if !reported_send_error {
+                                        let _ = events.send(MeshEvent::Status(format!(
+                                            "Falha enviando voz para {short}: {e}"
+                                        )));
+                                        reported_send_error = true;
+                                    }
+                                }
+                            }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => break,
