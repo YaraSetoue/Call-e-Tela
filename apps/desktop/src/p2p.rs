@@ -1,12 +1,13 @@
-//! WebRTC Mesh: SDP completo, DataChannel de teste e DataChannel de voz Opus.
-//! Esta etapa usa SCTP nao ordenado para validar voz. Migrar para RTP na etapa de qualidade.
+//! WebRTC Mesh: SDP completo e um unico DataChannel para teste e Opus.
+//! Diagnostico: usar o canal que ja foi comprovado funcional para isolar o fluxo de voz.
+//! Esta versao usa SCTP confiavel para teste; migrar voz para RTP na etapa de qualidade.
 
 use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
 
 use bytes::BytesMut;
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use webrtc::{
-    data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit},
+    data_channel::{DataChannel, DataChannelEvent},
     peer_connection::{
         PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
         RTCConfigurationBuilder, RTCIceGatheringState, RTCIceServer,
@@ -52,11 +53,20 @@ impl PeerConnectionEventHandler for Handler {
         let me = self.clone();
         tokio::spawn(async move {
             match data_channel.label().await {
-                Ok(name) if name == "voice-opus-v1" => start_voice_channel(
+                Ok(name) if name == "voice-screen-test" => start_media_channel(
                     me.peer, data_channel, me.events,
                     me.voice.subscribe(), me.playback,
                 ),
-                _ => start_test_channel(me.peer, data_channel, me.events),
+                Ok(name) => {
+                    let _ = me.events.send(MeshEvent::Status(format!(
+                        "Canal P2P inesperado recebido: {name}"
+                    )));
+                }
+                Err(e) => {
+                    let _ = me.events.send(MeshEvent::Status(format!(
+                        "Falha lendo identificador do canal P2P: {e}"
+                    )));
+                }
             }
         });
     }
@@ -69,28 +79,9 @@ impl Handler {
     }
 }
 
-fn start_test_channel(peer: String, channel: Arc<dyn DataChannel>, events: mpsc::UnboundedSender<MeshEvent>) {
-    tokio::spawn(async move {
-        let short = &peer[..peer.len().min(8)];
-        while let Some(event) = channel.poll().await {
-            match event {
-                DataChannelEvent::OnOpen => {
-                    let _ = events.send(MeshEvent::Status(format!("DataChannel P2P aberto com {short}")));
-                    let _ = channel.send_text("Ola! Esta mensagem veio diretamente pelo WebRTC.").await;
-                }
-                DataChannelEvent::OnMessage(message) => {
-                    if let Ok(text) = String::from_utf8(message.data.to_vec()) {
-                        let _ = events.send(MeshEvent::Status(format!("Recebido P2P de {short}: {text}")));
-                    }
-                }
-                DataChannelEvent::OnClose => break,
-                _ => {}
-            }
-        }
-    });
-}
-
-fn start_voice_channel(
+// Nesta etapa de diagnostico, teste P2P e voz compartilham o MESMO canal.
+// Ele ja funcionou entre redes diferentes; um segundo DataChannel nao sera necessario.
+fn start_media_channel(
     peer: String,
     channel: Arc<dyn DataChannel>,
     events: mpsc::UnboundedSender<MeshEvent>,
@@ -110,33 +101,66 @@ fn start_voice_channel(
         let mut packets_sent = 0u64;
         let mut packets_received = 0u64;
         let mut reported_send_error = false;
+        let mut warned_no_audio = false;
+        let mut watchdog = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let _ = events.send(MeshEvent::Status(format!(
+            "Canal P2P criado com {short}; aguardando OnOpen"
+        )));
+
         loop {
             tokio::select! {
                 received = channel.poll() => {
                     match received {
                         Some(DataChannelEvent::OnOpen) => {
                             opened = true;
-                            let _ = events.send(MeshEvent::Status(format!("Voz P2P disponivel com {short}")));
+                            let _ = events.send(MeshEvent::Status(format!(
+                                "Canal P2P ABERTO com {short} (teste e voz)"
+                            )));
                             let _ = events.send(MeshEvent::VoiceStats {
                                 peer: peer.clone(), sent: packets_sent, received: packets_received,
                             });
+                            if let Err(e) = channel.send_text("P2P aberto: teste e voz Opus no mesmo canal").await {
+                                let _ = events.send(MeshEvent::Status(format!(
+                                    "Falha no teste P2P para {short}: {e}"
+                                )));
+                            }
                         }
                         Some(DataChannelEvent::OnMessage(packet)) => {
-                            // Somente mensagens binarias do canal dedicado a voz.
-                            match decoder.decode(packet.data.as_ref(), &playback, &peer) {
-                                Ok(Some(_)) => {
-                                    packets_received += 1;
-                                    if packets_received == 1 || packets_received % 50 == 0 {
-                                        let _ = events.send(MeshEvent::VoiceStats {
-                                            peer: peer.clone(), sent: packets_sent, received: packets_received,
-                                        });
+                            let data = packet.data.as_ref();
+                            if data.starts_with(b"VSA1") {
+                                match decoder.decode(data, &playback, &peer) {
+                                    Ok(Some(_)) => {
+                                        packets_received += 1;
+                                        if packets_received == 1 || packets_received % 50 == 0 {
+                                            let _ = events.send(MeshEvent::VoiceStats {
+                                                peer: peer.clone(),
+                                                sent: packets_sent,
+                                                received: packets_received,
+                                            });
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        let _ = events.send(MeshEvent::Status(format!(
+                                            "Erro decodificando Opus de {short}: {e}"
+                                        )));
                                     }
                                 }
-                                Err(e) => {
-                                    let _ = events.send(MeshEvent::Status(format!("Falha decodificando voz: {e}")));
-                                }
-                                _ => {}
+                            } else if let Ok(text) = std::str::from_utf8(data) {
+                                let _ = events.send(MeshEvent::Status(format!(
+                                    "Mensagem P2P de {short}: {text}"
+                                )));
                             }
+                        }
+                        Some(DataChannelEvent::OnError) => {
+                            let _ = events.send(MeshEvent::Status(format!(
+                                "Erro no DataChannel P2P de {short}"
+                            )));
                         }
                         Some(DataChannelEvent::OnClose) | None => break,
                         _ => {}
@@ -145,34 +169,45 @@ fn start_voice_channel(
                 packet = outgoing.recv(), if opened => {
                     match packet {
                         Ok(data) => {
-                            // Evitar bloquear a transmissao se o buffer SCTP estiver cheio.
                             match channel.try_send(BytesMut::from(data.as_slice())).await {
                                 Ok(()) => {
                                     packets_sent += 1;
                                     if packets_sent == 1 || packets_sent % 50 == 0 {
                                         let _ = events.send(MeshEvent::VoiceStats {
-                                            peer: peer.clone(), sent: packets_sent, received: packets_received,
+                                            peer: peer.clone(),
+                                            sent: packets_sent,
+                                            received: packets_received,
                                         });
                                     }
                                 }
                                 Err(e) => {
                                     if !reported_send_error {
                                         let _ = events.send(MeshEvent::Status(format!(
-                                            "Falha enviando voz para {short}: {e}"
+                                            "Falha enviando Opus para {short}: {e}"
                                         )));
                                         reported_send_error = true;
                                     }
                                 }
                             }
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            let _ = events.send(MeshEvent::Status(format!(
+                                "Audio atrasado em {short}: {skipped} quadros descartados"
+                            )));
+                        }
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
+                }
+                _ = watchdog.tick(), if opened && packets_sent == 0 && !warned_no_audio => {
+                    warned_no_audio = true;
+                    let _ = events.send(MeshEvent::Status(format!(
+                        "Canal P2P aberto com {short}, mas ainda sem Opus enviado: verifique se o microfone esta LIGADO"
+                    )));
                 }
             }
         }
         playback.remove(&peer);
-        let _ = events.send(MeshEvent::Status(format!("Canal de voz encerrado: {short}")));
+        let _ = events.send(MeshEvent::Status(format!("Canal P2P encerrado: {short}")));
     });
 }
 
@@ -260,14 +295,10 @@ impl Mesh {
 
     pub async fn offer(&self, peer: &str) -> Result<(), AnyError> {
         let (pc, finished) = self.link_for(peer).await?;
-        let test_channel = pc.create_data_channel("voice-screen-test", None).await?;
-        start_test_channel(peer.to_owned(), test_channel, self.events.clone());
-        let voice_channel = pc.create_data_channel("voice-opus-v1", Some(RTCDataChannelInit {
-            ordered: false,
-            max_retransmits: Some(0),
-            ..Default::default()
-        })).await?;
-        start_voice_channel(peer.to_owned(), voice_channel, self.events.clone(),
+        // O canal de teste P2P existente passa a carregar mensagens e quadros Opus.
+        // Usa o modo confiavel padrao apenas para diagnosticar o primeiro audio.
+        let media_channel = pc.create_data_channel("voice-screen-test", None).await?;
+        start_media_channel(peer.to_owned(), media_channel, self.events.clone(),
             self.voice.subscribe(), self.playback.clone());
         let offer = pc.create_offer(None).await?;
         pc.set_local_description(offer).await?;

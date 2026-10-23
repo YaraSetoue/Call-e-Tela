@@ -105,7 +105,7 @@ slint::slint! {
                             Button { text: "Criar sala"; clicked => { root.create-room(); } }
                             Button { text: "Entrar"; clicked => { root.join-room(); } }
                         }
-                        Rectangle { height: 1px; background: #e6eaf0; }
+                        Rectangle { height: 1px; background: #506581; }
                         Text { text: "PARTICIPANTES"; font-size: 13px; font-weight: 700; color: #506581; }
                         Text {
                             text: root.participants-text;
@@ -223,7 +223,7 @@ slint::slint! {
                                     }
                                     Button { text: "Atualizar"; clicked => { root.refresh-outputs(); } }
                                 }
-                                Rectangle { height: 1px; background: #e6eaf0; }
+                                Rectangle { height: 1px; background: #506581; }
                                 Text { text: "Volume geral de saida"; font-size: 14px; font-weight: 700; color: rgb(49, 70, 94); }
                                 HorizontalLayout {
                                     spacing: 10px;
@@ -248,14 +248,14 @@ slint::slint! {
                                 spacing: 12px;
                                 Text { text: "Diagnostico da chamada"; font-size: 24px; font-weight: 700; color: #223450; }
                                 Text { text: "Use estes detalhes apenas ao investigar falhas de audio ou conexao."; font-size: 13px; color: #75849b; wrap: word-wrap; }
-                                Rectangle { height: 1px; background: #e6eaf0; }
-                                Text { text: "Pacotes Opus por participante"; font-size: 14px; font-weight: 700; color: rgb(49, 70, 94); }
+                                Rectangle { height: 1px; background: #506581; }
+                                Text { text: "Pacotes Opus por participante"; font-size: 14px; font-weight: 700; color: #223450; }
                                 Text { text: root.audio-stats-text; font-size: 13px; color: #175cd3; wrap: word-wrap; }
-                                Rectangle { height: 1px; background: #e6eaf0; }
-                                Text { text: "Eventos WebRTC"; font-size: 14px; font-weight: 700; color: rgb(49, 70, 94); }
+                                Rectangle { height: 1px; background: #506581; }
+                                Text { text: "Eventos WebRTC"; font-size: 14px; font-weight: 700; color: #223450; }
                                 Text { text: root.p2p-text; font-size: 12px; color: #53667f; wrap: word-wrap; }
                                 Rectangle { height: 1px; background: #e6eaf0; }
-                                Text { text: "Servidor de sinalizacao"; font-size: 14px; font-weight: 700; color: rgb(49, 70, 94); }
+                                Text { text: "Servidor de sinalizacao"; font-size: 14px; font-weight: 700; color: #223450; }
                                 LineEdit { text <=> root.server-url; }
                                 Text { text: "Alteracoes na URL passam a valer ao criar/entrar na proxima sala."; font-size: 12px; color: #75849b; wrap: word-wrap; }
                             }
