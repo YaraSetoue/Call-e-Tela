@@ -1,0 +1,229 @@
+import { ScrollView } from "std-widgets.slint";
+
+export global Theme {
+    out property <color> background: #101010;
+    out property <color> surface: #181818;
+    out property <color> control: #222222;
+    out property <color> hover: #303030;
+    out property <color> border: #303030;
+    out property <color> text: #f2f2f2;
+    out property <color> muted: #aaaaaa;
+    out property <color> disabled: #777777;
+}
+
+export component Button inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <bool> primary: false;
+    in property <bool> selected: false;
+    callback clicked();
+    min-width: label.preferred-width + 28px;
+    min-height: 38px;
+    vertical-stretch: 0;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: focus.has-focus ? Theme.text : Theme.border;
+    background: !enabled ? Theme.surface : touch.pressed ? #444444 : touch.has-hover ? (primary ? #ffffff : Theme.hover) : primary ? #dddddd : selected ? #363636 : Theme.control;
+    forward-focus: focus;
+    accessible-role: button;
+    accessible-label: text;
+    accessible-enabled: enabled;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
+    label := Text {
+        text: root.text;
+        color: !root.enabled ? Theme.disabled : root.primary ? Theme.background : Theme.text;
+        font-size: 13px;
+        font-weight: root.primary || root.selected ? 600 : 400;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == Key.Return || event.text == " " { root.clicked(); return accept; }
+            return reject;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { focus.focus(); root.clicked(); }
+    }
+}
+
+export component LineEdit inherits Rectangle {
+    in-out property <string> text <=> input.text;
+    in property <bool> enabled: true;
+    min-width: 100px;
+    min-height: 38px;
+    vertical-stretch: 0;
+    border-radius: 6px;
+    background: Theme.background;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.text : Theme.border;
+    forward-focus: input;
+    input := TextInput {
+        x: 12px;
+        width: parent.width - 24px;
+        height: parent.height;
+        enabled: root.enabled;
+        single-line: true;
+        vertical-alignment: center;
+        font-size: 13px;
+        color: root.enabled ? Theme.text : Theme.disabled;
+        selection-background-color: #cccccc;
+        selection-foreground-color: #101010;
+    }
+}
+
+export component Slider inherits Rectangle {
+    in property <float> minimum: 0;
+    in property <float> maximum: 100;
+    in property <float> step: 1;
+    in property <bool> enabled: true;
+    in-out property <float> value: minimum;
+    callback changed(float);
+    min-width: 100px;
+    min-height: 32px;
+    vertical-stretch: 0;
+    forward-focus: focus;
+    border-radius: 6px;
+    border-width: focus.has-focus ? 1px : 0px;
+    border-color: Theme.muted;
+    accessible-role: slider;
+    accessible-enabled: enabled;
+    accessible-value: value;
+    accessible-value-minimum: minimum;
+    accessible-value-maximum: maximum;
+    accessible-value-step: step;
+    accessible-action-increment => { root.set-value(root.value + root.step); }
+    accessible-action-decrement => { root.set-value(root.value - root.step); }
+    function set-value(next: float) {
+        if root.enabled {
+            let rounded = root.minimum + round((next - root.minimum) / max(0.001, root.step)) * root.step;
+            root.value = clamp(rounded, root.minimum, root.maximum);
+            root.changed(root.value);
+        }
+    }
+    function track-value() {
+        root.set-value(root.minimum + clamp((touch.mouse-x - 8px) / max(1px, root.width - 16px), 0, 1) * (root.maximum - root.minimum));
+    }
+    Rectangle {
+        x: 8px; y: (parent.height - 4px) / 2;
+        width: parent.width - 16px; height: 4px;
+        border-radius: 2px; background: Theme.hover;
+        Rectangle {
+            x: 0; y: 0;
+            width: parent.width * clamp((root.value - root.minimum) / max(0.001, root.maximum - root.minimum), 0, 1);
+            height: parent.height;
+            border-radius: 2px; background: root.enabled ? Theme.muted : Theme.disabled;
+        }
+    }
+    Rectangle {
+        x: 1px + (root.width - 16px) * clamp((root.value - root.minimum) / max(0.001, root.maximum - root.minimum), 0, 1);
+        y: (root.height - 14px) / 2;
+        width: 14px; height: 14px;
+        border-radius: 7px; background: root.enabled ? Theme.text : Theme.disabled;
+    }
+    focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == Key.RightArrow || event.text == Key.UpArrow { root.set-value(root.value + root.step); return accept; }
+            if event.text == Key.LeftArrow || event.text == Key.DownArrow { root.set-value(root.value - root.step); return accept; }
+            if event.text == Key.Home { root.set-value(root.minimum); return accept; }
+            if event.text == Key.End { root.set-value(root.maximum); return accept; }
+            return reject;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        pointer-event(event) => {
+            if event.button == PointerEventButton.left && event.kind == PointerEventKind.down { focus.focus(); root.track-value(); }
+        }
+        moved => { if self.pressed { root.track-value(); } }
+    }
+}
+
+export component ComboBox inherits Rectangle {
+    in property <[string]> model;
+    in property <bool> enabled: true;
+    in-out property <int> current-index: 0;
+    callback selected(string);
+    min-width: 140px;
+    min-height: 38px;
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+    border-radius: 6px;
+    background: touch.has-hover ? Theme.hover : Theme.control;
+    border-width: 1px;
+    border-color: focus.has-focus ? Theme.text : Theme.border;
+    forward-focus: focus;
+    accessible-role: combobox;
+    accessible-enabled: enabled;
+    accessible-value: current-index >= 0 && current-index < model.length ? model[current-index] : "";
+    accessible-action-expand => { root.open(); }
+    function choose(index: int) {
+        if root.enabled && root.model.length > 0 {
+            root.current-index = clamp(index, 0, root.model.length - 1);
+            root.selected(root.model[root.current-index]);
+        }
+    }
+    function open() {
+        if root.enabled && root.model.length > 0 { popup.show(); }
+    }
+    Text {
+        x: 12px; width: parent.width - 40px; height: parent.height;
+        text: root.current-index >= 0 && root.current-index < root.model.length ? root.model[root.current-index] : "Nenhum dispositivo";
+        color: root.enabled ? Theme.text : Theme.disabled;
+        font-size: 13px; vertical-alignment: center; overflow: elide;
+    }
+    Path {
+        x: parent.width - 25px; y: (parent.height - 5px) / 2;
+        width: 10px; height: 5px;
+        stroke: Theme.muted; stroke-width: 1.5px;
+        commands: "M 0 0 L 5 5 L 10 0";
+    }
+    focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == Key.Return || event.text == " " { root.open(); return accept; }
+            if event.text == Key.DownArrow { root.choose(root.current-index + 1); return accept; }
+            if event.text == Key.UpArrow { root.choose(root.current-index - 1); return accept; }
+            return reject;
+        }
+    }
+    touch := TouchArea { enabled: root.enabled; clicked => { focus.focus(); root.open(); } }
+    popup := PopupWindow {
+        y: root.height + 4px;
+        width: root.width;
+        height: min(root.model.length, 6) * 40px + 8px;
+        Rectangle {
+            background: Theme.control; border-radius: 6px;
+            border-width: 1px; border-color: Theme.border;
+            popup-focus := FocusScope {
+                init => { self.focus(); }
+                key-pressed(event) => {
+                    if event.text == Key.Escape || event.text == Key.Return || event.text == Key.Tab { popup.close(); focus.focus(); return accept; }
+                    if event.text == Key.DownArrow { root.choose(root.current-index + 1); return accept; }
+                    if event.text == Key.UpArrow { root.choose(root.current-index - 1); return accept; }
+                    if event.text == Key.Home { root.choose(0); return accept; }
+                    if event.text == Key.End { root.choose(root.model.length - 1); return accept; }
+                    return reject;
+                }
+                ScrollView {
+                    x: 4px; y: 4px; width: parent.width - 8px; height: parent.height - 8px;
+                    content-y: -max(0, root.current-index - 5) * 40px;
+                    VerticalLayout {
+                        spacing: 0px;
+                        for item[index] in root.model : Rectangle {
+                            height: 40px;
+                            background: row.has-hover || root.current-index == index ? Theme.hover : Theme.control;
+                            Text { x: 10px; width: parent.width - 20px; height: parent.height; text: item; color: Theme.text; font-size: 13px; vertical-alignment: center; overflow: elide; }
+                            row := TouchArea { clicked => { root.choose(index); popup.close(); focus.focus(); } }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
