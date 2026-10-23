@@ -1,3 +1,4 @@
+mod audio;
 mod p2p;
 
 use std::{collections::HashMap, sync::Arc};
@@ -5,16 +6,17 @@ use std::{collections::HashMap, sync::Arc};
 use futures_util::{SinkExt, StreamExt};
 use p2p::{Mesh, MeshEvent};
 use slint::ComponentHandle;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+use audio::AudioSession;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use voice_protocol::{ClientMessage, ServerMessage, SignalPayload};
 
 slint::slint! {
     import { Button, LineEdit } from "std-widgets.slint";
     export component MainWindow inherits Window {
-        title: "Voice Screen - Etapa 2 (WebRTC)";
+        title: "Voice Screen - Etapa 5 (Voz)";
         width: 640px;
-        height: 525px;
+        height: 560px;
         in-out property <string> server-url: "wss://voz.virtuabil.cloud/ws";
         in-out property <string> display-name: "Participante";
         in-out property <string> room-code: "";
@@ -23,6 +25,8 @@ slint::slint! {
         in-out property <string> p2p-text: "O teste P2P iniciara quando um segundo participante entrar.";
         callback create-room();
         callback join-room();
+        in-out property <bool> microphone-enabled: false;
+        callback toggle-microphone();
         VerticalLayout {
             padding: 20px;
             spacing: 10px;
@@ -38,6 +42,10 @@ slint::slint! {
                 Button { text: "Criar sala"; clicked => { root.create-room(); } }
                 Button { text: "Entrar na sala"; clicked => { root.join-room(); } }
             }
+            Button {
+                text: root.microphone-enabled ? "Desligar microfone" : "Ligar microfone";
+                clicked => { root.toggle-microphone(); }
+            }
             Text { text: root.status-text; wrap: word-wrap; }
             Text { text: root.participants-text; wrap: word-wrap; }
             Text { text: "Eventos P2P:"; font-weight: 700; }
@@ -50,7 +58,7 @@ slint::slint! {
                 }
             }
             Text {
-                text: "Prototipo: negocia WebRTC e envia saudacao por DataChannel. Sem voz/tela ainda. TURN temporario disponivel quando enviado pela VPS.";
+                text: "Primeiro teste de voz: microfone desligado por padrao. Use fones para evitar eco. Audio Opus trafega por DataChannel P2P (prototipo); compartilhamento de tela vira depois.";
                 wrap: word-wrap;
                 color: #667085;
             }
@@ -91,7 +99,12 @@ fn add_log(log: &mut Vec<String>, message: String) {
     if log.len() > 7 { log.remove(0); }
 }
 
-async fn connection(weak: slint::Weak<MainWindow>, command: ConnectionCommand) {
+async fn connection(
+    weak: slint::Weak<MainWindow>,
+    command: ConnectionCommand,
+    mut mic_state: watch::Receiver<bool>,
+    mut cancel: watch::Receiver<bool>,
+) {
     update_ui(&weak, None, "Conectando ao servidor...".into(), "".into(), "".into());
     let (socket, _) = match connect_async(&command.url).await {
         Ok(pair) => pair,
@@ -115,7 +128,11 @@ async fn connection(weak: slint::Weak<MainWindow>, command: ConnectionCommand) {
 
     let (signal_tx, mut signal_rx) = mpsc::unbounded_channel::<ClientMessage>();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<MeshEvent>();
-    let mesh = Arc::new(Mesh::new(signal_tx, event_tx.clone()));
+    let audio = AudioSession::new(event_tx.clone());
+    let mesh = Arc::new(Mesh::new(
+        signal_tx, event_tx.clone(), audio.frames.clone(), audio.playback.clone(),
+    ));
+    audio.capture(*mic_state.borrow());
     let mut peers: HashMap<String, String> = HashMap::new();
     let mut log: Vec<String> = Vec::new();
     let mut status = "Conectado ao WebSocket".to_owned();
@@ -123,6 +140,11 @@ async fn connection(weak: slint::Weak<MainWindow>, command: ConnectionCommand) {
 
     loop {
         tokio::select! {
+            _ = cancel.changed() => { break; }
+            changed = mic_state.changed() => {
+                if changed.is_err() { break; }
+                audio.capture(*mic_state.borrow());
+            }
             incoming = stream.next() => {
                 let Some(msg) = incoming else { break; };
                 let text = match msg {
@@ -217,6 +239,7 @@ async fn connection(weak: slint::Weak<MainWindow>, command: ConnectionCommand) {
             }
         }
     }
+    audio.capture(false);
     mesh.close_all().await;
     update_ui(&weak, None, format!("Desconectado. {status}"), "".into(), log.join("\n"));
 }
@@ -229,15 +252,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ui = MainWindow::new()?;
     let (tx, mut rx) = mpsc::unbounded_channel::<ConnectionCommand>();
+    let (mic_tx, mic_rx) = watch::channel(false);
     let weak = ui.as_weak();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().expect("Erro criando runtime Tokio");
         runtime.block_on(async move {
-            let mut job: Option<tokio::task::JoinHandle<()>> = None;
+            let mut job: Option<(watch::Sender<bool>, tokio::task::JoinHandle<()>)> = None;
             while let Some(command) = rx.recv().await {
-                if let Some(old) = job.take() { old.abort(); }
-                job = Some(tokio::spawn(connection(weak.clone(), command)));
+                if let Some((stop, old)) = job.take() {
+                    stop.send_replace(true);
+                    let _ = old.await;
+                }
+                let (stop, cancel) = watch::channel(false);
+                let mic = mic_rx.clone();
+                job = Some((stop, tokio::spawn(connection(weak.clone(), command, mic, cancel))));
+            }
+            if let Some((stop, task)) = job {
+                stop.send_replace(true);
+                let _ = task.await;
             }
         });
     });
@@ -263,6 +296,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             };
             let _ = tx.send(command);
+        }
+    });
+    let mic_toggle = mic_tx;
+    let weak_for_microphone = ui.as_weak();
+    ui.on_toggle_microphone(move || {
+        if let Some(ui) = weak_for_microphone.upgrade() {
+            let enabled = !ui.get_microphone_enabled();
+            ui.set_microphone_enabled(enabled);
+            mic_toggle.send_replace(enabled);
         }
     });
     ui.run()?;

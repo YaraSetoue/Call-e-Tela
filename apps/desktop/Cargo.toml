@@ -14,3 +14,7 @@ serde_json.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 webrtc = "=0.21.1"
 async-trait = "0.1"
+# Audio da etapa 5 (somente no cliente Windows)
+cpal = "=0.16.0"
+opus = "=0.4.0"
+bytes = "1"
