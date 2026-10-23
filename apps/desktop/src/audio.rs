@@ -263,7 +263,14 @@ fn input_stream(
                     packet.extend_from_slice(&seq.to_be_bytes());
                     packet.extend_from_slice(&encoded[..len]);
                     seq = seq.wrapping_add(1);
-                    let _ = sender.send(packet);
+                    let first_frame = seq == 1;
+                    let subscribers = if first_frame { sender.receiver_count() } else { 0 };
+                    let accepted = sender.send(packet).is_ok();
+                    if first_frame {
+                        let _ = events.send(MeshEvent::Status(format!(
+                            "Opus local OK: primeiro quadro codificado; assinantes P2P={subscribers}; broadcast aceito={accepted}"
+                        )));
+                    }
                     if seq % 50 == 0 { // update every ~1 second, not every audio packet
                         let _ = events.send(MeshEvent::MicLevel(peak));
                         peak = 0.0;
