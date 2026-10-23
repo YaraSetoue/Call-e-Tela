@@ -1,0 +1,12 @@
+FROM rust:1-bookworm AS build
+WORKDIR /app
+COPY . .
+RUN cargo build --release -p signaling-server
+
+FROM debian:bookworm-slim
+RUN useradd --system --uid 10001 --create-home voice
+COPY --from=build /app/target/release/signaling-server /usr/local/bin/signaling-server
+USER voice
+EXPOSE 8080
+ENV BIND_ADDR=0.0.0.0:8080
+CMD ["signaling-server"]

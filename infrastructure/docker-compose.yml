@@ -1,0 +1,26 @@
+services:
+  signaling:
+    build:
+      context: ..
+      dockerfile: infrastructure/Dockerfile.server
+    container_name: voice-signaling
+    restart: unless-stopped
+    environment:
+      BIND_ADDR: "0.0.0.0:8080"
+      RUST_LOG: "signaling_server=info"
+    ports:
+      - "127.0.0.1:8080:8080"
+    security_opt:
+      - no-new-privileges:true
+
+  # Optional, stage 2: activate with --profile turn after generating the config.
+  coturn:
+    profiles: ["turn"]
+    image: coturn/coturn:4.18.0
+    container_name: voice-coturn
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    security_opt:
+      - no-new-privileges:true

@@ -1,0 +1,6 @@
+/target/
+.env
+infrastructure/coturn/turnserver.conf
+*.log
+.idea/
+.vscode/
