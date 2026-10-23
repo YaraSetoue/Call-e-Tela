@@ -10,6 +10,15 @@ case "$DOMAIN" in
 esac
 command -v openssl >/dev/null || { echo "Instale openssl" >&2; exit 1; }
 FILE="infrastructure/coturn/turnserver.conf"
+
+if [ -e "$FILE" ]; then
+    echo "$FILE ja existe: configuracao preservada" >&2
+    exit 1
+fi
+
+# Cria o diretório caso não exista
+mkdir -p "$(dirname "$FILE")"
+
 if [ -e "$FILE" ]; then
   echo "$FILE ja existe: configuracao preservada" >&2
   exit 1
