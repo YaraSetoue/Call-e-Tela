@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use sha1::Sha1;
 
 use axum::{
     extract::{ws::{Message, WebSocket, WebSocketUpgrade}, State},
@@ -15,7 +19,56 @@ use voice_protocol::{ClientMessage, PeerInfo, ServerMessage, ROOM_CAPACITY};
 #[derive(Clone, Default)]
 struct AppState {
     rooms: Arc<Mutex<HashMap<String, Room>>>,
+    turn: Option<Arc<TurnConfig>>,
 }
+
+/// O segredo vem SOMENTE do arquivo privado do Coturn, montado read-only no container.
+struct TurnConfig {
+    host: String,
+    secret: String,
+}
+
+impl TurnConfig {
+    fn load() -> Result<Option<Self>, Box<dyn std::error::Error>> {
+        let path = match std::env::var("TURN_SECRET_FILE") {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        // Arquivo dedicado 0400 (UID 10001), derivado do segredo do Coturn.
+        let file = std::fs::read_to_string(path)?;
+        let secret = file.trim();
+        if secret.is_empty() { return Err("TURN_SHARED_SECRET vazio".into()); }
+        let host = std::env::var("TURN_HOST")?;
+        if host.is_empty() || !host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+            return Err("TURN_HOST invalido".into());
+        }
+        Ok(Some(Self { host, secret: secret.to_owned() }))
+    }
+
+    fn credentials(&self, peer_id: &str) -> ServerMessage {
+        // Coturn REST: usuario = timestamp de expiracao : id; senha = base64(HMAC-SHA1).
+        let expires_at = (SystemTime::now() + Duration::from_secs(3600))
+            .duration_since(UNIX_EPOCH)
+            .expect("Relogio do sistema invalido")
+            .as_secs();
+        let username = format!("{expires_at}:{peer_id}");
+        let mut mac = Hmac::<Sha1>::new_from_slice(self.secret.as_bytes())
+            .expect("HMAC aceita chave de qualquer tamanho");
+        mac.update(username.as_bytes());
+        let credential = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+        ServerMessage::TurnCredentials {
+            urls: vec![
+                format!("stun:{}:3478", self.host),
+                format!("turn:{}:3478?transport=udp", self.host),
+                format!("turn:{}:3478?transport=tcp", self.host),
+            ],
+            username,
+            credential,
+            expires_at,
+        }
+    }
+}
+
 
 #[derive(Default)]
 struct Room {
@@ -34,7 +87,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| "signaling_server=info".into()))
         .init();
 
-    let state = AppState::default();
+    let turn = TurnConfig::load()?.map(Arc::new);
+    if turn.is_some() { info!("Credenciais TURN temporarias habilitadas"); }
+    else { warn!("TURN nao configurado: ICE usara apenas STUN publico"); }
+    let state = AppState { turn, ..Default::default() };
     let app = Router::new()
         .route("/health", get(|| async { Json(serde_json::json!({"status": "ok"})) }))
         .route("/ws", any(ws_handler))
@@ -107,6 +163,11 @@ async fn client_session(socket: WebSocket, state: AppState) {
                 rooms.insert(room_id.clone(), room);
                 drop(rooms);
                 membership = Some(room_id.clone());
+                // Enviar as credenciais ANTES de confirmar a sala, para o cliente montar
+                // a PeerConnection com TURN antes de gerar a oferta SDP.
+                if let Some(turn) = &state.turn {
+                    let _ = tx.try_send(turn.credentials(&peer_id));
+                }
                 let _ = tx.try_send(ServerMessage::RoomCreated { room_id, peer_id: peer_id.clone() });
             }
             ClientMessage::JoinRoom { room_id, name } => {
@@ -138,7 +199,10 @@ async fn client_session(socket: WebSocket, state: AppState) {
                     id: id.clone(), name: peer.name.clone(),
                 }).collect::<Vec<_>>();
                 let new_peer = PeerInfo { id: peer_id.clone(), name: name.trim().into() };
-                // The joined client's reply goes out before notifications of future joins.
+                // Enviar credenciais ANTES do evento que inicia as ofertas P2P.
+                if let Some(turn) = &state.turn {
+                    let _ = tx.try_send(turn.credentials(&peer_id));
+                }
                 let _ = tx.try_send(ServerMessage::RoomJoined {
                     room_id: room_id.clone(), peer_id: peer_id.clone(), peers,
                 });
@@ -184,7 +248,25 @@ async fn client_session(socket: WebSocket, state: AppState) {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_name;
+    use super::{valid_name, TurnConfig};
+    use voice_protocol::ServerMessage;
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    use sha1::Sha1;
+
+    #[test]
+    fn turn_credentials_match_shared_secret() {
+        let cfg = TurnConfig { host: "voz.virtuabil.cloud".into(), secret: "chave-de-teste".into() };
+        if let ServerMessage::TurnCredentials { username, credential, urls, expires_at } = cfg.credentials("abc") {
+            assert!(username.ends_with(":abc"));
+            assert_eq!(expires_at.to_string(), username.split(':').next().unwrap());
+            assert_eq!(urls.len(), 3);
+            let mut mac = Hmac::<Sha1>::new_from_slice(cfg.secret.as_bytes()).unwrap();
+            mac.update(username.as_bytes());
+            let expected = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+            assert_eq!(credential, expected);
+        } else { panic!("evento inesperado") }
+    }
     #[test]
     fn validate_names() {
         assert!(valid_name("Usuario A"));

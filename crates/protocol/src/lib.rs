@@ -37,6 +37,13 @@ pub enum ServerMessage {
     RoomJoined { room_id: String, peer_id: String, peers: Vec<PeerInfo> },
     PeerJoined { peer: PeerInfo },
     PeerLeft { peer_id: String },
+    /// Credenciais temporarias para STUN/TURN. Nunca contem o segredo compartilhado.
+    TurnCredentials {
+        urls: Vec<String>,
+        username: String,
+        credential: String,
+        expires_at: u64,
+    },
     Signal { from: String, payload: SignalPayload },
     Error { code: String, message: String },
 }

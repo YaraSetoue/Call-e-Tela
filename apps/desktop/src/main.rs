@@ -50,7 +50,7 @@ slint::slint! {
                 }
             }
             Text {
-                text: "Prototipo: negocia WebRTC e envia saudacao por DataChannel. Sem voz/tela ainda. TURN nao configurado.";
+                text: "Prototipo: negocia WebRTC e envia saudacao por DataChannel. Sem voz/tela ainda. TURN temporario disponivel quando enviado pela VPS.";
                 wrap: word-wrap;
                 color: #667085;
             }
@@ -159,6 +159,10 @@ async fn connection(weak: slint::Weak<MainWindow>, command: ConnectionCommand) {
                     ServerMessage::PeerJoined { peer } => {
                         status = format!("{} entrou na sala. Aguardando oferta WebRTC...", peer.name);
                         peers.insert(peer.id, peer.name);
+                    }
+                    ServerMessage::TurnCredentials { urls, username, credential, expires_at: _ } => {
+                        // Nao registrar a senha TURN em logs nem na UI.
+                        mesh.set_turn_credentials(urls, username, credential).await;
                     }
                     ServerMessage::PeerLeft { peer_id } => {
                         let name = peers.remove(&peer_id).unwrap_or_else(|| "Participante".into());

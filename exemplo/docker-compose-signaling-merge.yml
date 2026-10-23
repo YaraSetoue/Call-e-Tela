@@ -1,0 +1,8 @@
+# MESCLAR com o sinalizador do projeto ja em producao. NAO substitua compose existente.
+services:
+  signaling:
+    environment:
+      TURN_SECRET_FILE: /run/secrets/turn_secret
+      TURN_HOST: voz.virtuabil.cloud
+    volumes:
+      - ./coturn/signaling-turn-secret:/run/secrets/turn_secret:ro

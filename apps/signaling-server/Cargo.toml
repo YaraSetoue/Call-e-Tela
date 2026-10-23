@@ -13,3 +13,8 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+
+# Credenciais TURN REST (compativeis com use-auth-secret do Coturn)
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"

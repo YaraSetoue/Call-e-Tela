@@ -110,6 +110,7 @@ pub struct Mesh {
     links: Mutex<HashMap<String, Link>>,
     signaling: mpsc::UnboundedSender<ClientMessage>,
     events: mpsc::UnboundedSender<MeshEvent>,
+    ice_servers: Mutex<Vec<RTCIceServer>>,
 }
 
 impl Mesh {
@@ -117,7 +118,31 @@ impl Mesh {
         signaling: mpsc::UnboundedSender<ClientMessage>,
         events: mpsc::UnboundedSender<MeshEvent>,
     ) -> Self {
-        Self { links: Mutex::new(HashMap::new()), signaling, events }
+        Self {
+            links: Mutex::new(HashMap::new()),
+            signaling,
+            events,
+            ice_servers: Mutex::new(vec![RTCIceServer {
+                urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+                ..Default::default()
+            }]),
+        }
+    }
+
+    /// Atualizar ICE antes que qualquer PeerConnection seja criada.
+    /// O servidor envia TurnCredentials antes de RoomJoined/RoomCreated.
+    pub async fn set_turn_credentials(&self, urls: Vec<String>, username: String, credential: String) {
+        let mut servers = self.ice_servers.lock().await;
+        // STUN publico como fallback; TURN somente com credenciais temporarias.
+        *servers = vec![
+            RTCIceServer {
+                urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+                ..Default::default()
+            },
+            RTCIceServer { urls, username, credential, ..Default::default() },
+        ];
+        drop(servers);
+        self.emit("STUN/TURN configurados para novas conexoes WebRTC.");
     }
 
     fn emit(&self, message: impl Into<String>) {
@@ -125,16 +150,15 @@ impl Mesh {
     }
 
     async fn link_for(&self, peer: &str) -> Result<(Arc<dyn PeerConnection>, watch::Receiver<bool>), AnyError> {
+        // Obter a configuracao ICE ANTES do mutex de peers evita inversao de locks.
+        let ice_servers = self.ice_servers.lock().await.clone();
         let mut map = self.links.lock().await;
         if let Some(link) = map.get(peer) {
             return Ok((link.connection.clone(), link.ice_done.clone()));
         }
         let (gathering, ice_done) = watch::channel(false);
         let config = RTCConfigurationBuilder::default()
-            .with_ice_servers(vec![RTCIceServer {
-                urls: vec!["stun:stun.l.google.com:19302".to_string()],
-                ..Default::default()
-            }])
+            .with_ice_servers(ice_servers)
             .build();
         let handler = Handler {
             peer: peer.to_owned(),

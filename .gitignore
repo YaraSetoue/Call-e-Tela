@@ -4,3 +4,6 @@ infrastructure/coturn/turnserver.conf
 *.log
 .idea/
 .vscode/
+
+# Chave privada compartilhada para autenticacao TURN
+infrastructure/coturn/signaling-turn-secret
