@@ -1,12 +1,13 @@
 mod audio;
 mod p2p;
+mod screen;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::{Arc, atomic::{AtomicBool, Ordering}}};
 
 use futures_util::{SinkExt, StreamExt};
 use p2p::{Mesh, MeshEvent};
 use slint::{ComponentHandle, Model};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use audio::{AudioSession, PlaybackBus, microphone_names, output_device_names};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use voice_protocol::{ClientMessage, ServerMessage, SignalPayload};
@@ -50,6 +51,12 @@ slint::slint! {
         in-out property <[PeerMixRow]> peer-volumes: [];
         in-out property <string> audio-stats-text: "Aguardando participantes para iniciar o canal de voz.";
         in-out property <int> active-section: 0;
+        // Compartilhamento inicial: 720p a 15 FPS. Perfis futuros documentados.
+        in-out property <bool> screen-sharing: false;
+        in-out property <image> screen-frame;
+        in-out property <string> screen-status: "Nenhuma tela sendo compartilhada";
+        in-out property <[string]> screen-monitors: ["Monitor principal"];
+        in-out property <int> screen-monitor-index: 0;
 
         callback create-room();
         callback join-room();
@@ -61,6 +68,10 @@ slint::slint! {
         callback refresh-outputs();
         callback change-master-volume(float);
         callback change-peer-volume(string, float);
+        callback start-screen();
+        callback stop-screen();
+        callback select-screen-monitor(int);
+        callback refresh-screen-monitors();
 
         VerticalLayout {
             spacing: 0px;
@@ -83,6 +94,7 @@ slint::slint! {
                     Rectangle { background: transparent; horizontal-stretch: 1; }
                     Button { text: "Chamada"; selected: root.active-section == 0; clicked => { root.active-section = 0; } }
                     Button { text: "Dispositivos"; selected: root.active-section == 1; clicked => { root.active-section = 1; } }
+                    Button { text: "Tela"; selected: root.active-section == 3; clicked => { root.active-section = 3; } }
                     Button { text: "Diagnóstico"; selected: root.active-section == 2; clicked => { root.active-section = 2; } }
                 }
             }
@@ -238,6 +250,39 @@ slint::slint! {
                             }
                         }
 
+                         // Visualizacao de tela. Botao de compartilhar tambem no rodape.
+                         if root.active-section == 3 : VerticalLayout {
+                             padding: 20px;
+                             spacing: 10px;
+                             Text { text: "Compartilhamento de tela"; font-size: 22px; font-weight: 600; color: Theme.text; }
+                             Text { text: "720p (ate 1280x720) - 15 FPS | MVP"; color: Theme.muted; font-size: 13px; }
+                             HorizontalLayout {
+                                 spacing: 10px;
+                                 monitor_picker := ComboBox {
+                                     model: root.screen-monitors;
+                                     current-index: root.screen-monitor-index;
+                                     selected(_value) => { root.select-screen-monitor(monitor_picker.current-index); }
+                                 }
+                                 Button { text: "Atualizar"; clicked => { root.refresh-screen-monitors(); } }
+                             }
+                             Text { text: root.screen-status; wrap: word-wrap; color: Theme.muted; font-size: 12px; }
+                             Rectangle {
+                                 background: #090909;
+                                 border-width: 1px;
+                                 border-color: Theme.border;
+                                 border-radius: 6px;
+                                 vertical-stretch: 1;
+                                 Image {
+                                     width: parent.width;
+                                     height: parent.height;
+                                     source: root.screen-frame;
+                                     image-fit: contain;
+                                 }
+                             }
+                             Text { text: "Versao inicial experimental: apenas um apresentador por vez. Futuro: H.264/RTP e perfis de qualidade.";
+                                    font-size: 12px; color: Theme.muted; wrap: word-wrap; }
+                         }
+
                         // Logs ficam numa aba separada, sem poluir a experiencia.
                         if root.active-section == 2 : ScrollView {
                             VerticalLayout {
@@ -275,6 +320,13 @@ slint::slint! {
                     Text { text: root.microphone-enabled ? "Microfone ligado" : "Microfone desligado"; color: Theme.muted; font-size: 14px; }
                     Rectangle { background: transparent; horizontal-stretch: 1; }
                     Button { text: "Testar saída"; clicked => { root.test-speaker(); } }
+                    Button {
+                         text: root.screen-sharing ? "Parar tela" : "Compartilhar tela";
+                         clicked => {
+                             if root.screen-sharing { root.stop-screen(); }
+                             else { root.active-section = 3; root.start-screen(); }
+                         }
+                     }
                     Button {
                         primary: true;
                         text: root.microphone-enabled ? "Desligar microfone" : "Ligar microfone";
@@ -358,6 +410,7 @@ async fn connection(
     mut selected_mic: watch::Receiver<usize>,
     mut selected_output: watch::Receiver<usize>,
     mut speaker_test: watch::Receiver<u64>,
+     mut screen_state: watch::Receiver<Option<usize>>,
     mut cancel: watch::Receiver<bool>,
     playback: PlaybackBus,
 ) {
@@ -384,15 +437,19 @@ async fn connection(
 
     let (signal_tx, mut signal_rx) = mpsc::unbounded_channel::<ClientMessage>();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<MeshEvent>();
+     let (screen_frames_tx, _) = broadcast::channel::<Vec<u8>>(2);
     let audio = AudioSession::new(event_tx.clone(), playback);
     let mesh = Arc::new(Mesh::new(
-        signal_tx, event_tx.clone(), audio.frames.clone(), audio.playback.clone(),
+        signal_tx, event_tx.clone(), audio.frames.clone(), screen_frames_tx.clone(), audio.playback.clone(),
     ));
     audio.output(*selected_output.borrow());
     audio.capture(*mic_state.borrow(), *selected_mic.borrow());
     let mut peers: HashMap<String, String> = HashMap::new();
     let mut voice_stats: HashMap<String, (u64, u64)> = HashMap::new();
     let mut log: Vec<String> = Vec::new();
+     let mut screen_capture: Option<screen::CaptureHandle> = None;
+     let mut screen_owner: Option<String> = None;
+     let decode_busy = Arc::new(AtomicBool::new(false));
     let mut status = "Conectado ao WebSocket".to_owned();
     let mut room = None;
 
@@ -411,6 +468,29 @@ async fn connection(
                 if changed.is_err() { break; }
                 audio.output(*selected_output.borrow());
             }
+             changed = screen_state.changed() => {
+                 if changed.is_err() { break; }
+                 // Interrompe captura anterior antes de iniciar outro monitor.
+                 screen_capture = None;
+                 let _ = screen_frames_tx.send(b"VSS0".to_vec());
+                 let _ = event_tx.send(MeshEvent::ScreenStopped { peer: "__local__".to_owned() });
+                 match *screen_state.borrow() {
+                     Some(index) if room.is_some() => {
+                         match screen::CaptureHandle::start(index, screen_frames_tx.clone(), event_tx.clone()) {
+                             Ok(capture) => {
+                                 screen_capture = Some(capture);
+                                 add_log(&mut log, "Compartilhando tela: 720p / 15 FPS".into());
+                             }
+                             Err(err) => {
+                                 add_log(&mut log, format!("Nao foi possivel compartilhar tela: {err}"));
+                             }
+                         }
+                     }
+                     Some(_) => add_log(&mut log, "Entre em uma sala antes de compartilhar tela".into()),
+                     None => add_log(&mut log, "Compartilhamento encerrado".into()),
+                 }
+                 update_ui(&weak, room.clone(), status.clone(), user_list(&peers), log.join("\n"));
+             }
             changed = speaker_test.changed() => {
                 if changed.is_err() { break; }
                 audio.playback.test_speaker();
@@ -543,6 +623,43 @@ async fn connection(
                         voice_stats.insert(peer, (sent, received));
                         update_voice_stats(&weak, &peers, &voice_stats);
                     }
+                     MeshEvent::ScreenFrame { peer, jpeg } => {
+                         // Um compartilhamento por vez na interface nesta etapa.
+                         if screen_owner.is_none() { screen_owner = Some(peer.clone()); }
+                         if screen_owner.as_deref() == Some(peer.as_str())
+                             && !decode_busy.swap(true, Ordering::AcqRel)
+                         {
+                             let weak_image = weak.clone();
+                             let busy = decode_busy.clone();
+                             tokio::task::spawn_blocking(move || {
+                                 if let Ok(image) = image::load_from_memory(&jpeg) {
+                                     let rgb = image.to_rgb8();
+                                     let pixels = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(
+                                         rgb.as_raw(), rgb.width(), rgb.height()
+                                     );
+                                     let owner_label = if peer == "__local__" { "Sua tela".to_string() }
+                                         else { format!("Tela de {}", &peer[..peer.len().min(8)]) };
+                                     let _ = weak_image.upgrade_in_event_loop(move |ui| {
+                                         ui.set_screen_frame(slint::Image::from_rgb8(pixels));
+                                         ui.set_screen_status(format!("{owner_label} - 720p / 15 FPS").into());
+                                     });
+                                 }
+                                 busy.store(false, Ordering::Release);
+                             });
+                         }
+                         continue;
+                     }
+                     MeshEvent::ScreenStopped { peer } => {
+                         if screen_owner.as_deref() == Some(peer.as_str()) {
+                             screen_owner = None;
+                             let weak_screen = weak.clone();
+                             let _ = weak_screen.upgrade_in_event_loop(move |ui| {
+                                 ui.set_screen_frame(slint::Image::default());
+                                 ui.set_screen_status("Compartilhamento encerrado".into());
+                             });
+                         }
+                         continue;
+                     }
                     MeshEvent::MicLevel(level) => {
                         let mic_label = if level < 0.005 {
                             "Microfone: sinal muito baixo / silencio".to_owned()
@@ -559,6 +676,8 @@ async fn connection(
             }
         }
     }
+     screen_capture = None;
+     let _ = screen_frames_tx.send(b"VSS0".to_vec());
     audio.capture(false, *selected_mic.borrow());
     mesh.close_all().await;
     update_ui(&weak, None, format!("Desconectado. {status}"), "".into(), log.join("\n"));
@@ -576,6 +695,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (selected_tx, selected_rx) = watch::channel(0usize);
     let (test_tx, test_rx) = watch::channel(0u64);
     let (output_tx, output_rx) = watch::channel(0usize);
+     let (screen_tx, screen_rx) = watch::channel(None::<usize>);
     let playback = PlaybackBus::default();
     let microphones = microphone_names();
     let microphone_model = slint::VecModel::from(microphones.into_iter()
@@ -585,6 +705,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_model = slint::VecModel::from(outputs.into_iter()
         .map(slint::SharedString::from).collect::<Vec<_>>());
     ui.set_output_list(slint::ModelRc::new(output_model));
+     ui.set_screen_monitors(slint::ModelRc::new(slint::VecModel::from(
+         screen::monitor_names().into_iter().map(slint::SharedString::from).collect::<Vec<_>>()
+     )));
     let weak = ui.as_weak();
     let session_playback = playback.clone();
     std::thread::spawn(move || {
@@ -602,8 +725,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let selected = selected_rx.clone();
                 let test = test_rx.clone();
                 let output = output_rx.clone();
+                 let screen_state = screen_rx.clone();
                 job = Some((stop, tokio::spawn(connection(
-                    weak.clone(), command, mic, selected, output, test, cancel, session_playback.clone(),
+                     weak.clone(), command, mic, selected, output, test, screen_state, cancel, session_playback.clone(),
                 ))));
             }
             if let Some((stop, task)) = job {
@@ -716,6 +840,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let next = (*test_tx.borrow()).wrapping_add(1);
         test_tx.send_replace(next);
     });
+     let screen_enable_tx = screen_tx.clone();
+     let weak_start = ui.as_weak();
+     ui.on_start_screen(move || {
+         if let Some(ui) = weak_start.upgrade() {
+             let index = ui.get_screen_monitor_index().max(0) as usize;
+             ui.set_screen_sharing(true);
+             ui.set_screen_status("Iniciando captura 720p / 15 FPS...".into());
+             screen_enable_tx.send_replace(Some(index));
+         }
+     });
+     let screen_disable_tx = screen_tx.clone();
+     let weak_stop = ui.as_weak();
+     ui.on_stop_screen(move || {
+         screen_disable_tx.send_replace(None);
+         if let Some(ui) = weak_stop.upgrade() {
+             ui.set_screen_sharing(false);
+             ui.set_screen_status("Compartilhamento encerrado".into());
+             ui.set_screen_frame(slint::Image::default());
+         }
+     });
+     let weak_pick = ui.as_weak();
+     ui.on_select_screen_monitor(move |index| {
+         if let Some(ui) = weak_pick.upgrade() {
+             ui.set_screen_monitor_index(index.max(0));
+         }
+     });
+     let weak_refresh_screen = ui.as_weak();
+     ui.on_refresh_screen_monitors(move || {
+         if let Some(ui) = weak_refresh_screen.upgrade() {
+             let model = slint::VecModel::from(screen::monitor_names().into_iter()
+                 .map(slint::SharedString::from).collect::<Vec<_>>());
+             ui.set_screen_monitors(slint::ModelRc::new(model));
+             ui.set_screen_monitor_index(0);
+         }
+     });
+
     ui.run()?;
     Ok(())
 }

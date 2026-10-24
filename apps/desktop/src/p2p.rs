@@ -3,11 +3,12 @@
 //! Esta versao usa SCTP confiavel para teste; migrar voz para RTP na etapa de qualidade.
 
 use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
+use crate::screen::{self, Reassembler};
 
 use bytes::BytesMut;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use webrtc::{
-    data_channel::{DataChannel, DataChannelEvent},
+    data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit},
     peer_connection::{
         PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
         RTCConfigurationBuilder, RTCIceGatheringState, RTCIceServer, RTCIceTransportPolicy,
@@ -25,6 +26,8 @@ pub enum MeshEvent {
     Status(String),
     MicLevel(f32),
     VoiceStats { peer: String, sent: u64, received: u64 },
+    ScreenFrame { peer: String, jpeg: Vec<u8> },
+    ScreenStopped { peer: String },
 }
 
 #[derive(Clone)]
@@ -33,6 +36,7 @@ struct Handler {
     events: mpsc::UnboundedSender<MeshEvent>,
     signaling: mpsc::UnboundedSender<ClientMessage>,
     voice: broadcast::Sender<Vec<u8>>,
+    screen_frames: broadcast::Sender<Vec<u8>>,
     playback: PlaybackBus,
 }
 
@@ -78,6 +82,9 @@ impl PeerConnectionEventHandler for Handler {
         let me = self.clone();
         tokio::spawn(async move {
             match data_channel.label().await {
+                Ok(name) if name == "voice-screen-jpeg-v1" => start_screen_channel(
+                    me.peer, data_channel, me.events, me.screen_frames.subscribe(),
+                ),
                 Ok(name) if name == "voice-screen-test" => start_media_channel(
                     me.peer, data_channel, me.events,
                     me.voice.subscribe(), me.playback,
@@ -246,6 +253,78 @@ fn start_media_channel(
     });
 }
 
+// Canal de tela separado do canal Opus: imagens atrasadas sao descartadas.
+fn start_screen_channel(
+    peer: String,
+    channel: Arc<dyn DataChannel>,
+    events: mpsc::UnboundedSender<MeshEvent>,
+    mut outgoing: broadcast::Receiver<Vec<u8>>,
+) {
+    tokio::spawn(async move {
+        let short = peer[..peer.len().min(8)].to_owned();
+        let mut ready = false;
+        let mut assembler = Reassembler::new();
+        let mut frame_id: u32 = 0;
+        let mut errors = 0u32;
+        loop {
+            tokio::select! {
+                event = channel.poll() => {
+                    match event {
+                        Some(DataChannelEvent::OnOpen) => {
+                            ready = true;
+                            let _ = events.send(MeshEvent::Status(format!("Tela P2P disponivel com {short}")));
+                        }
+                        Some(DataChannelEvent::OnMessage(packet)) => {
+                            let data = packet.data.as_ref();
+                            if data == b"VSS0" {
+                                let _ = events.send(MeshEvent::ScreenStopped { peer: peer.clone() });
+                            } else if let Some(jpeg) = assembler.push(data) {
+                                let _ = events.send(MeshEvent::ScreenFrame { peer: peer.clone(), jpeg });
+                            }
+                        }
+                        Some(DataChannelEvent::OnClose) | None => break,
+                        _ => {}
+                    }
+                }
+                packet = outgoing.recv(), if ready => {
+                    match packet {
+                        Ok(mut data) => {
+                            // Nunca acumular quadros antigos se a rede estiver lenta.
+                            while let Ok(next) = outgoing.try_recv() { data = next; }
+                            if data.as_slice() == b"VSS0" {
+                                let _ = channel.send(BytesMut::from(data.as_slice())).await;
+                                continue;
+                            }
+                            frame_id = frame_id.wrapping_add(1);
+                            if let Some(parts) = screen::chunks(frame_id, &data) {
+                                for part in parts {
+                                    // Limitar o tempo de espera e manter a voz responsiva.
+                                    let result = tokio::time::timeout(
+                                        Duration::from_millis(35),
+                                        channel.send(BytesMut::from(part.as_slice())),
+                                    ).await;
+                                    if !matches!(result, Ok(Ok(()))) {
+                                        errors += 1;
+                                        if errors == 1 {
+                                            let _ = events.send(MeshEvent::Status(format!(
+                                                "Tela atrasada para {short}; quadro descartado para preservar audio"
+                                            )));
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+        let _ = events.send(MeshEvent::ScreenStopped { peer });
+    });
+}
+
 struct Link {
     connection: Arc<dyn PeerConnection>,
     remote_ready: bool,
@@ -259,6 +338,7 @@ pub struct Mesh {
     events: mpsc::UnboundedSender<MeshEvent>,
     ice_servers: Mutex<Vec<RTCIceServer>>,
     voice: broadcast::Sender<Vec<u8>>,
+    screen_frames: broadcast::Sender<Vec<u8>>,
     playback: PlaybackBus,
 }
 
@@ -267,11 +347,12 @@ impl Mesh {
         signaling: mpsc::UnboundedSender<ClientMessage>,
         events: mpsc::UnboundedSender<MeshEvent>,
         voice: broadcast::Sender<Vec<u8>>,
+        screen_frames: broadcast::Sender<Vec<u8>>,
         playback: PlaybackBus,
     ) -> Self {
         Self {
             links: Mutex::new(HashMap::new()),
-            early_ice: Mutex::new(HashMap::new()), signaling, events, voice, playback,
+            early_ice: Mutex::new(HashMap::new()), signaling, events, voice, screen_frames, playback,
             ice_servers: Mutex::new(vec![RTCIceServer {
                 urls: vec!["stun:stun.l.google.com:19302".to_owned()],
                 ..Default::default()
@@ -311,7 +392,7 @@ impl Mesh {
         let config = builder.build();
         let handler = Handler {
             peer: peer.to_owned(), events: self.events.clone(), signaling: self.signaling.clone(),
-            voice: self.voice.clone(), playback: self.playback.clone(),
+            voice: self.voice.clone(), screen_frames: self.screen_frames.clone(), playback: self.playback.clone(),
         };
         let pc: Arc<dyn PeerConnection> = Arc::new(
             PeerConnectionBuilder::new()
@@ -397,6 +478,12 @@ impl Mesh {
         let media_channel = pc.create_data_channel("voice-screen-test", None).await?;
         start_media_channel(peer.to_owned(), media_channel, self.events.clone(),
             self.voice.subscribe(), self.playback.clone());
+        let screen_channel = pc.create_data_channel("voice-screen-jpeg-v1", Some(RTCDataChannelInit {
+            ordered: false,
+            max_packet_life_time: Some(220),
+            ..Default::default()
+        })).await?;
+        start_screen_channel(peer.to_owned(), screen_channel, self.events.clone(), self.screen_frames.subscribe());
         self.emit(format!("DataChannel P2P criado para {}; gerando oferta", &peer[..peer.len().min(8)]));
         let offer = pc.create_offer(None).await?;
         pc.set_local_description(offer).await?;
