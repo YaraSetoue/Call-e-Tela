@@ -1,16 +1,17 @@
-//! WebRTC Mesh: SDP completo e um unico DataChannel para teste e Opus.
+//! WebRTC Mesh: sinalizacao Trickle ICE e um unico DataChannel para teste e Opus.
 //! Diagnostico: usar o canal que ja foi comprovado funcional para isolar o fluxo de voz.
 //! Esta versao usa SCTP confiavel para teste; migrar voz para RTP na etapa de qualidade.
 
 use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
 
 use bytes::BytesMut;
-use tokio::sync::{broadcast, mpsc, watch, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use webrtc::{
     data_channel::{DataChannel, DataChannelEvent},
     peer_connection::{
         PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
-        RTCConfigurationBuilder, RTCIceGatheringState, RTCIceServer,
+        RTCConfigurationBuilder, RTCIceGatheringState, RTCIceServer, RTCIceTransportPolicy,
+        RTCPeerConnectionIceEvent, RTCIceCandidateInit,
         RTCPeerConnectionState, RTCSessionDescription,
     },
 };
@@ -30,18 +31,41 @@ pub enum MeshEvent {
 struct Handler {
     peer: String,
     events: mpsc::UnboundedSender<MeshEvent>,
-    gathering: watch::Sender<bool>,
+    signaling: mpsc::UnboundedSender<ClientMessage>,
     voice: broadcast::Sender<Vec<u8>>,
     playback: PlaybackBus,
 }
 
 #[async_trait::async_trait]
 impl PeerConnectionEventHandler for Handler {
+    async fn on_ice_candidate(&self, event: RTCPeerConnectionIceEvent) {
+        match event.candidate.to_json() {
+            Ok(candidate) => {
+                let kind = if candidate.candidate.contains(" typ relay ") {
+                    "relay"
+                } else if candidate.candidate.contains(" typ srflx ") {
+                    "srflx"
+                } else {
+                    "host/outro"
+                };
+                self.emit(format!("ICE local {}: candidato {kind}", self.short_peer()));
+                if let Err(err) = self.signaling.send(ClientMessage::Signal {
+                    to: self.peer.clone(),
+                    payload: SignalPayload::IceCandidate {
+                        candidate: candidate.candidate,
+                        sdp_mid: candidate.sdp_mid,
+                        sdp_mline_index: candidate.sdp_mline_index,
+                    },
+                }) {
+                    self.emit(format!("ICE local {} nao enviado para a sinalizacao: {err}", self.short_peer()));
+                }
+            }
+            Err(err) => self.emit(format!("Falha serializando ICE de {}: {err}", self.short_peer())),
+        }
+    }
+
     async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
         self.emit(format!("ICE gathering {}: {state:?}", self.short_peer()));
-        if state == RTCIceGatheringState::Complete {
-            self.gathering.send_replace(true);
-        }
     }
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
@@ -224,11 +248,13 @@ fn start_media_channel(
 
 struct Link {
     connection: Arc<dyn PeerConnection>,
-    ice_done: watch::Receiver<bool>,
+    remote_ready: bool,
+    pending_ice: Vec<RTCIceCandidateInit>,
 }
 
 pub struct Mesh {
     links: Mutex<HashMap<String, Link>>,
+    early_ice: Mutex<HashMap<String, Vec<RTCIceCandidateInit>>>,
     signaling: mpsc::UnboundedSender<ClientMessage>,
     events: mpsc::UnboundedSender<MeshEvent>,
     ice_servers: Mutex<Vec<RTCIceServer>>,
@@ -244,7 +270,8 @@ impl Mesh {
         playback: PlaybackBus,
     ) -> Self {
         Self {
-            links: Mutex::new(HashMap::new()), signaling, events, voice, playback,
+            links: Mutex::new(HashMap::new()),
+            early_ice: Mutex::new(HashMap::new()), signaling, events, voice, playback,
             ice_servers: Mutex::new(vec![RTCIceServer {
                 urls: vec!["stun:stun.l.google.com:19302".to_owned()],
                 ..Default::default()
@@ -253,6 +280,8 @@ impl Mesh {
     }
 
     pub async fn set_turn_credentials(&self, urls: Vec<String>, username: String, credential: String) {
+        self.emit(format!("Credenciais TURN recebidas: {} URLs; usuario presente: {}; senha presente: {}",
+            urls.len(), !username.is_empty(), !credential.is_empty()));
         let mut servers = self.ice_servers.lock().await;
         *servers = vec![
             RTCIceServer { urls: vec!["stun:stun.l.google.com:19302".to_owned()], ..Default::default() },
@@ -266,17 +295,22 @@ impl Mesh {
         let _ = self.events.send(MeshEvent::Status(message.into()));
     }
 
-    async fn link_for(&self, peer: &str) -> Result<(Arc<dyn PeerConnection>, watch::Receiver<bool>), AnyError> {
+    async fn link_for(&self, peer: &str) -> Result<Arc<dyn PeerConnection>, AnyError> {
         let ice_servers = self.ice_servers.lock().await.clone();
         self.emit(format!("Montando PeerConnection para {} ({} servidores ICE)", &peer[..peer.len().min(8)], ice_servers.len()));
         let mut map = self.links.lock().await;
         if let Some(link) = map.get(peer) {
-            return Ok((link.connection.clone(), link.ice_done.clone()));
+            return Ok(link.connection.clone());
         }
-        let (gathering, ice_done) = watch::channel(false);
-        let config = RTCConfigurationBuilder::default().with_ice_servers(ice_servers).build();
+        let relay_only = std::env::var("VOICE_FORCE_RELAY").as_deref() == Ok("1");
+        let mut builder = RTCConfigurationBuilder::default().with_ice_servers(ice_servers);
+        if relay_only {
+            self.emit("MODO TESTE: ICE somente TURN/relay (VOICE_FORCE_RELAY=1)");
+            builder = builder.with_ice_transport_policy(RTCIceTransportPolicy::Relay);
+        }
+        let config = builder.build();
         let handler = Handler {
-            peer: peer.to_owned(), events: self.events.clone(), gathering,
+            peer: peer.to_owned(), events: self.events.clone(), signaling: self.signaling.clone(),
             voice: self.voice.clone(), playback: self.playback.clone(),
         };
         let pc: Arc<dyn PeerConnection> = Arc::new(
@@ -287,28 +321,77 @@ impl Mesh {
                 .with_udp_addrs(vec!["0.0.0.0:0".to_owned()])
                 .build().await?,
         );
-        map.insert(peer.to_owned(), Link { connection: pc.clone(), ice_done: ice_done.clone() });
+        let pending_ice = self.early_ice.lock().await.remove(peer).unwrap_or_default();
+        map.insert(peer.to_owned(), Link { connection: pc.clone(), remote_ready: false, pending_ice });
         self.emit(format!("PeerConnection criada para {}", &peer[..peer.len().min(8)]));
-        Ok((pc, ice_done))
+        Ok(pc)
     }
 
-    async fn gathered_sdp(
-        pc: &Arc<dyn PeerConnection>,
-        mut finished: watch::Receiver<bool>,
-    ) -> Result<String, AnyError> {
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while !*finished.borrow() {
-                finished.changed().await.map_err(|_| "ICE gathering interrompido")?;
+    // Candidatos podem chegar antes da oferta/resposta SDP. Guarda-los e aplicar
+    // somente depois que a descricao remota for instalada evita corridas.
+    pub async fn apply_candidate(
+        &self,
+        peer: &str,
+        candidate: String,
+        sdp_mid: Option<String>,
+        sdp_mline_index: Option<u16>,
+    ) -> Result<(), AnyError> {
+        let kind = if candidate.contains(" typ relay ") { "relay" }
+            else if candidate.contains(" typ srflx ") { "srflx" }
+            else { "host/outro" };
+        let short_peer = &peer[..peer.len().min(8)];
+        self.emit(format!("ICE remoto recebido de {short_peer}: {kind}"));
+        let init = RTCIceCandidateInit {
+            candidate,
+            sdp_mid,
+            sdp_mline_index,
+            ..Default::default()
+        };
+        let ready_connection = {
+            let mut links = self.links.lock().await;
+            if let Some(link) = links.get_mut(peer) {
+                if link.remote_ready {
+                    Some(link.connection.clone())
+                } else {
+                    link.pending_ice.push(init.clone());
+                    None
+                }
+            } else {
+                self.early_ice.lock().await.entry(peer.to_owned()).or_default().push(init.clone());
+                None
             }
-            Ok::<(), AnyError>(())
-        }).await??;
-        let desc = pc.local_description().await.ok_or("SDP local nao disponivel")?;
-        Ok(desc.sdp)
+        };
+        if let Some(pc) = ready_connection {
+            pc.add_ice_candidate(init).await?;
+            self.emit(format!("ICE remoto aplicado de {short_peer}: {kind}"));
+        } else {
+            self.emit(format!("ICE remoto aguardando SDP de {short_peer}: {kind}"));
+        }
+        Ok(())
+    }
+
+    async fn remote_ready(&self, peer: &str) -> Result<(), AnyError> {
+        let (pc, pending) = {
+            let mut map = self.links.lock().await;
+            let link = map.get_mut(peer).ok_or("PeerConnection ausente ao aplicar ICE")?;
+            link.remote_ready = true;
+            (link.connection.clone(), std::mem::take(&mut link.pending_ice))
+        };
+        let mut applied = 0usize;
+        for candidate in pending {
+            match pc.add_ice_candidate(candidate).await {
+                Ok(()) => applied += 1,
+                Err(err) => self.emit(format!("Candidato ICE remoto de {} rejeitado: {err}", &peer[..peer.len().min(8)])),
+            }
+        }
+        self.emit(format!("SDP remoto pronto para {}; {} candidatos ICE pendentes aplicados",
+            &peer[..peer.len().min(8)], applied));
+        Ok(())
     }
 
     pub async fn offer(&self, peer: &str) -> Result<(), AnyError> {
         self.emit(format!("Comecando oferta P2P para {}", &peer[..peer.len().min(8)]));
-        let (pc, finished) = self.link_for(peer).await?;
+        let pc = self.link_for(peer).await?;
         // O canal de teste P2P existente passa a carregar mensagens e quadros Opus.
         // Usa o modo confiavel padrao apenas para diagnosticar o primeiro audio.
         let media_channel = pc.create_data_channel("voice-screen-test", None).await?;
@@ -317,8 +400,8 @@ impl Mesh {
         self.emit(format!("DataChannel P2P criado para {}; gerando oferta", &peer[..peer.len().min(8)]));
         let offer = pc.create_offer(None).await?;
         pc.set_local_description(offer).await?;
-        self.emit(format!("Reunindo candidatos ICE para {}...", &peer[..peer.len().min(8)]));
-        let sdp = Self::gathered_sdp(&pc, finished).await?;
+        self.emit(format!("Enviando oferta SDP imediatamente; candidatos ICE seguem depois para {}", &peer[..peer.len().min(8)]));
+        let sdp = pc.local_description().await.ok_or("SDP local nao disponivel")?.sdp;
         self.signaling.send(ClientMessage::Signal {
             to: peer.to_owned(), payload: SignalPayload::Offer { sdp },
         })?;
@@ -328,13 +411,14 @@ impl Mesh {
 
     pub async fn answer(&self, peer: &str, sdp: String) -> Result<(), AnyError> {
         self.emit(format!("Comecando resposta P2P para {}", &peer[..peer.len().min(8)]));
-        let (pc, finished) = self.link_for(peer).await?;
+        let pc = self.link_for(peer).await?;
         self.emit(format!("Aplicando oferta remota de {}", &peer[..peer.len().min(8)]));
         pc.set_remote_description(RTCSessionDescription::offer(sdp)?).await?;
+        self.remote_ready(peer).await?;
         let answer = pc.create_answer(None).await?;
         pc.set_local_description(answer).await?;
-        self.emit(format!("Resposta local pronta; aguardando ICE {}", &peer[..peer.len().min(8)]));
-        let sdp = Self::gathered_sdp(&pc, finished).await?;
+        self.emit(format!("Resposta SDP imediata; ICE segue em mensagens separadas para {}", &peer[..peer.len().min(8)]));
+        let sdp = pc.local_description().await.ok_or("SDP local nao disponivel")?.sdp;
         self.signaling.send(ClientMessage::Signal {
             to: peer.to_owned(), payload: SignalPayload::Answer { sdp },
         })?;
@@ -349,6 +433,7 @@ impl Mesh {
             map.get(peer).map(|l| l.connection.clone()).ok_or("Resposta de peer desconhecido")?
         };
         pc.set_remote_description(RTCSessionDescription::answer(sdp)?).await?;
+        self.remote_ready(peer).await?;
         self.emit(format!("Resposta WebRTC recebida de {}", &peer[..peer.len().min(8)]));
         Ok(())
     }
@@ -356,6 +441,7 @@ impl Mesh {
     pub async fn leave(&self, peer: &str) {
         let old = self.links.lock().await.remove(peer);
         if let Some(link) = old { let _ = link.connection.close().await; }
+        self.early_ice.lock().await.remove(peer);
         self.playback.remove(peer);
     }
 
@@ -365,5 +451,6 @@ impl Mesh {
             map.drain().map(|(_, link)| link.connection).collect::<Vec<_>>()
         };
         for pc in all { let _ = pc.close().await; }
+        self.early_ice.lock().await.clear();
     }
 }
