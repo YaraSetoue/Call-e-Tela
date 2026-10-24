@@ -33,6 +33,7 @@ slint::slint! {
         preferred-width: 1060px;
         preferred-height: 720px;
         background: Theme.background;
+        full-screen: root.fullscreen-video;
         min-width: 900px;
         min-height: 640px;
         default-font-family: "Segoe UI";
@@ -65,6 +66,13 @@ slint::slint! {
         in-out property <int> screen-monitor-index: 0;
         in-out property <[LiveStreamRow]> live-streams: [];
         in-out property <string> watching-stream-id: "";
+        in-out property <bool> fullscreen-video: false;
+        in-out property <int> viewer-count: 0;
+        // Perfis aplicados na proxima inicializacao do compartilhamento.
+        in-out property <[string]> video-resolutions: ["144p", "560p", "720p", "1080p", "1440p"];
+        in-out property <[string]> video-fps-options: ["15 FPS", "30 FPS", "60 FPS"];
+        in-out property <int> video-resolution-index: 2;
+        in-out property <int> video-fps-index: 0;
 
         callback create-room();
         callback join-room();
@@ -83,8 +91,35 @@ slint::slint! {
         callback refresh-screen-monitors();
         callback watch-screen(string);
         callback leave-screen();
+        callback select-video-resolution(int);
+        callback select-video-fps(int);
 
-        VerticalLayout {
+        if root.fullscreen-video : VerticalLayout {
+            spacing: 0px;
+            Rectangle {
+                height: 44px;
+                background: Theme.background;
+                HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 16px;
+                    spacing: 12px;
+                    Text { text: root.screen-status; color: Theme.text; horizontal-stretch: 1; }
+                    Button { text: "Sair da tela cheia"; clicked => { root.fullscreen-video = false; } }
+                }
+            }
+            Rectangle {
+                background: #090909;
+                vertical-stretch: 1;
+                Image {
+                    width: parent.width;
+                    height: parent.height;
+                    source: root.screen-frame;
+                    image-fit: contain;
+                }
+            }
+        }
+
+        if !root.fullscreen-video : VerticalLayout {
             spacing: 0px;
 
             // Cabecalho simples: principal primeiro, configuracoes fora do caminho.
@@ -284,7 +319,7 @@ slint::slint! {
                              padding: 20px;
                              spacing: 10px;
                              Text { text: "Compartilhamento de tela"; font-size: 22px; font-weight: 600; color: Theme.text; }
-                             Text { text: "720p (ate 1280x720) - 15 FPS | MVP"; color: Theme.muted; font-size: 13px; }
+                             Text { text: "H.264 / Opus - Qualidade configuravel por quem compartilha"; color: Theme.muted; font-size: 13px; }
                              Text { text: "TRANSMISSOES DISPONIVEIS"; color: Theme.muted; font-size: 12px; font-weight: 600; }
                              if root.live-streams.length == 0 : Text {
                                  text: "Nenhuma transmissao ativa no momento.";
@@ -304,7 +339,27 @@ slint::slint! {
                                  clicked => { root.leave-screen(); }
                              }
                              Rectangle { height: 1px; background: Theme.border; }
-                             Text { text: "MINHA TRANSMISSAO"; color: Theme.muted; font-size: 12px; font-weight: 600; }
+                             HorizontalLayout {
+                                 Text { text: "MINHA TRANSMISSAO"; color: Theme.muted; font-size: 12px; font-weight: 600; horizontal-stretch: 1; }
+                                 Text { text: root.screen-sharing ? "Espectadores: " + root.viewer-count : "Transmissao inativa";
+                                        color: Theme.text; font-size: 13px; }
+                             }
+                             HorizontalLayout {
+                                 spacing: 10px;
+                                 Text { text: "Qualidade"; color: Theme.muted; font-size: 12px; }
+                                 resolution_picker := ComboBox {
+                                     model: root.video-resolutions;
+                                     current-index: root.video-resolution-index;
+                                     selected(_value) => { root.select-video-resolution(resolution_picker.current-index); }
+                                 }
+                                 fps_picker := ComboBox {
+                                     model: root.video-fps-options;
+                                     current-index: root.video-fps-index;
+                                     selected(_value) => { root.select-video-fps(fps_picker.current-index); }
+                                 }
+                             }
+                             Text { text: "Novas opcoes de qualidade valem no proximo compartilhamento; 1080p/1440p e 30/60 FPS exigem mais CPU.";
+                                    font-size: 12px; color: Theme.muted; wrap: word-wrap; }
                              HorizontalLayout {
                                  spacing: 10px;
                                  monitor_picker := ComboBox {
@@ -323,6 +378,10 @@ slint::slint! {
                              }
                              Text { text: "Opcional: transmite videos e apps do Windows, sem repetir a voz da chamada. Requer Windows 11 ou Windows 10 atualizado."; color: Theme.muted; font-size: 12px; wrap: word-wrap; }
                              Text { text: root.screen-status; wrap: word-wrap; color: Theme.muted; font-size: 12px; }
+                             if root.watching-stream-id != "" || root.screen-sharing : Button {
+                                 text: "Tela cheia";
+                                 clicked => { root.fullscreen-video = true; }
+                             }
                              Rectangle {
                                  background: #090909;
                                  border-width: 1px;
@@ -484,6 +543,7 @@ async fn connection(
     mut selected_output: watch::Receiver<usize>,
     mut speaker_test: watch::Receiver<u64>,
      mut screen_state: watch::Receiver<Option<usize>>,
+    quality: watch::Receiver<screen::VideoProfile>,
     mut system_audio_state: watch::Receiver<bool>,
     mut watch_state: watch::Receiver<Option<String>>,
     watch_tx: watch::Sender<Option<String>>,
@@ -528,6 +588,7 @@ async fn connection(
     audio.capture(*mic_state.borrow(), *selected_mic.borrow());
     let mut peers: HashMap<String, String> = HashMap::new();
     let mut live_streams: HashSet<String> = HashSet::new();
+    let mut viewers: HashSet<String> = HashSet::new();
     let mut voice_stats: HashMap<String, (u64, u64)> = HashMap::new();
     let mut log: Vec<String> = Vec::new();
      let mut screen_capture: Option<screen::CaptureHandle> = None;
@@ -562,6 +623,7 @@ async fn connection(
                 let _ = weak.upgrade_in_event_loop(move |ui| {
                     ui.set_screen_frame(slint::Image::default());
                     ui.set_watching_stream_id(target.clone().unwrap_or_default().into());
+                    if target.is_none() { ui.set_fullscreen_video(false); }
                     if let Some(label) = label {
                         ui.set_screen_status(format!("Entrando na transmissao de {label}...").into());
                     } else {
@@ -577,14 +639,17 @@ async fn connection(
                  drop(system_audio_capture.take());
                  drop(screen_capture.take());
                  let _ = screen_frames_tx.send(b"VSS0".to_vec());
+                 viewers.clear();
+                 let _ = weak.upgrade_in_event_loop(|ui| ui.set_viewer_count(0));
                  let _ = event_tx.send(MeshEvent::ScreenStopped { peer: "__local__".to_owned() });
                  match *screen_state.borrow() {
                      Some(index) if room.is_some() => {
-                         match screen::CaptureHandle::start(index, screen_frames_tx.clone(), event_tx.clone()) {
+                         let profile = *quality.borrow();
+                         match screen::CaptureHandle::start(index, screen_frames_tx.clone(), event_tx.clone(), profile) {
                              Ok(capture) => {
                                  screen_capture = Some(capture);
                                  mesh.set_local_screen_live(true);
-                                 add_log(&mut log, "Compartilhando tela: 720p / 15 FPS".into());
+                                 add_log(&mut log, format!("Compartilhando tela: {}", profile.label()));
                                  if *system_audio_state.borrow() {
                                      match screen_audio::CaptureHandle::start(system_audio_tx.clone(), event_tx.clone()) {
                                          Ok(handle) => { system_audio_capture = Some(handle); }
@@ -670,6 +735,10 @@ async fn connection(
                         let name = peers.remove(&peer_id).unwrap_or_else(|| "Participante".into());
                         voice_stats.remove(&peer_id);
                         live_streams.remove(&peer_id);
+                        if viewers.remove(&peer_id) {
+                            let count = viewers.len() as i32;
+                            let _ = weak.upgrade_in_event_loop(move |ui| ui.set_viewer_count(count));
+                        }
                         update_live_streams(&weak, &peers, &live_streams);
                         let was_watching = watch_state.borrow().as_deref() == Some(peer_id.as_str());
                         if was_watching { watch_tx.send_replace(None); }
@@ -748,6 +817,13 @@ async fn connection(
             Some(event) = event_rx.recv() => {
                 match event {
                     MeshEvent::Status(message) => add_log(&mut log, message),
+                    MeshEvent::ViewerChanged { peer, watching } => {
+                        if watching { viewers.insert(peer); }
+                        else { viewers.remove(&peer); }
+                        let count = if screen_capture.is_some() { viewers.len() as i32 } else { 0 };
+                        let _ = weak.upgrade_in_event_loop(move |ui| ui.set_viewer_count(count));
+                        continue;
+                    },
                     MeshEvent::VoiceStats { peer, sent, received } => {
                         voice_stats.insert(peer, (sent, received));
                         update_voice_stats(&weak, &peers, &voice_stats);
@@ -780,9 +856,10 @@ async fn connection(
                                      );
                                      let owner_label = if peer == "__local__" { "Sua tela".to_string() }
                                          else { format!("Tela de {}", &peer[..peer.len().min(8)]) };
+                                     let resolution = format!("{}x{}", rgb.width(), rgb.height());
                                      let _ = weak_image.upgrade_in_event_loop(move |ui| {
                                          ui.set_screen_frame(slint::Image::from_rgb8(pixels));
-                                         ui.set_screen_status(format!("{owner_label} - 720p / 15 FPS").into());
+                                         ui.set_screen_status(format!("{owner_label} - {resolution}").into());
                                      });
                                  }
                                  busy.store(false, Ordering::Release);
@@ -812,7 +889,7 @@ async fn connection(
                              let _ = weak.upgrade_in_event_loop(move |ui| {
                                  ui.set_screen_frame(slint::Image::from_rgb8(pixels));
                                  ui.set_screen_status(format!(
-                                     "{owner_label} - 720p / 15 FPS"
+                                     "{owner_label} - {width}x{height}"
                                  ).into());
                                  busy.store(false, Ordering::Release);
                              });
@@ -870,6 +947,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (test_tx, test_rx) = watch::channel(0u64);
     let (output_tx, output_rx) = watch::channel(0usize);
      let (screen_tx, screen_rx) = watch::channel(None::<usize>);
+    let (quality_tx, quality_rx) = watch::channel(screen::VideoProfile::from_indices(2, 0));
      let (sysaudio_tx, sysaudio_rx) = watch::channel(false);
      let (watch_tx, watch_rx) = watch::channel(None::<String>);
     let playback = PlaybackBus::default();
@@ -903,11 +981,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let test = test_rx.clone();
                 let output = output_rx.clone();
                  let screen_state = screen_rx.clone();
+                 let quality = quality_rx.clone();
                  let system_audio_state = sysaudio_rx.clone();
                  let watch_state = watch_rx.clone();
                  let watching_sender = watch_tx_for_runtime.clone();
                 job = Some((stop, tokio::spawn(connection(
-                     weak.clone(), command, mic, selected, output, test, screen_state, system_audio_state,
+                     weak.clone(), command, mic, selected, output, test, screen_state, quality, system_audio_state,
                      watch_state, watching_sender, cancel, session_playback.clone(),
                 ))));
             }
@@ -1021,6 +1100,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let next = (*test_tx.borrow()).wrapping_add(1);
         test_tx.send_replace(next);
     });
+     let resolutions_tx = quality_tx.clone();
+     let weak_resolution = ui.as_weak();
+     ui.on_select_video_resolution(move |index| {
+         if let Some(ui) = weak_resolution.upgrade() {
+             let value = index.clamp(0, 4);
+             ui.set_video_resolution_index(value);
+             resolutions_tx.send_replace(screen::VideoProfile::from_indices(
+                 value as usize, ui.get_video_fps_index().max(0) as usize,
+             ));
+         }
+     });
+     let fps_tx = quality_tx;
+     let weak_fps = ui.as_weak();
+     ui.on_select_video_fps(move |index| {
+         if let Some(ui) = weak_fps.upgrade() {
+             let value = index.clamp(0, 2);
+             ui.set_video_fps_index(value);
+             fps_tx.send_replace(screen::VideoProfile::from_indices(
+                 ui.get_video_resolution_index().max(0) as usize, value as usize,
+             ));
+         }
+     });
      ui.on_toggle_screen_audio(move |enabled| {
          sysaudio_tx.send_replace(enabled);
      });
@@ -1030,7 +1131,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          if let Some(ui) = weak_start.upgrade() {
              let index = ui.get_screen_monitor_index().max(0) as usize;
              ui.set_screen_sharing(true);
-             ui.set_screen_status("Iniciando H.264 720p / 15 FPS...".into());
+             let profile = screen::VideoProfile::from_indices(
+                 ui.get_video_resolution_index().max(0) as usize,
+                 ui.get_video_fps_index().max(0) as usize,
+             );
+             ui.set_screen_status(format!("Iniciando H.264 {}...", profile.label()).into());
              screen_enable_tx.send_replace(Some(index));
          }
      });
@@ -1040,6 +1145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          screen_disable_tx.send_replace(None);
          if let Some(ui) = weak_stop.upgrade() {
              ui.set_screen_sharing(false);
+             ui.set_fullscreen_video(false);
              if ui.get_watching_stream_id().is_empty() {
                  ui.set_screen_status("Compartilhamento encerrado".into());
                  ui.set_screen_frame(slint::Image::default());
@@ -1078,6 +1184,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         leave_control.send_replace(None);
         if let Some(ui) = weak_leave.upgrade() {
             ui.set_watching_stream_id("".into());
+            ui.set_fullscreen_video(false);
             ui.set_screen_frame(slint::Image::default());
             ui.set_screen_status("Voce saiu da transmissao. A chamada continua.".into());
         }

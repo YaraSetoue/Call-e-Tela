@@ -31,6 +31,7 @@ pub enum MeshEvent {
     ScreenRgbFrame { peer: String, width: u32, height: u32, rgb: Vec<u8> },
     ScreenStopped { peer: String },
     StreamAvailability { peer: String, live: bool },
+    ViewerChanged { peer: String, watching: bool },
 }
 
 #[derive(Clone)]
@@ -204,12 +205,18 @@ fn start_media_channel(
                                 let _ = events.send(MeshEvent::StreamAvailability {
                                     peer: peer.clone(), live: data == b"VSC1:LIVE",
                                 });
-                            } else if data == b"VSC1:WATCH" {
-                                subscribed.store(true, Ordering::Release);
-                                let _ = events.send(MeshEvent::Status(format!("{short} entrou na transmissao")));
-                            } else if data == b"VSC1:UNWATCH" {
-                                subscribed.store(false, Ordering::Release);
-                                let _ = events.send(MeshEvent::Status(format!("{short} saiu da transmissao")));
+                            } else if data == b"VSC1:WATCH" || data == b"VSC1:UNWATCH" {
+                                let watching = data == b"VSC1:WATCH";
+                                let before = subscribed.swap(watching, Ordering::AcqRel);
+                                if before != watching {
+                                    let _ = events.send(MeshEvent::ViewerChanged {
+                                        peer: peer.clone(), watching,
+                                    });
+                                    let action = if watching { "entrou" } else { "saiu" };
+                                    let _ = events.send(MeshEvent::Status(format!(
+                                        "{short} {action} da transmissao"
+                                    )));
+                                }
                             } else if let Ok(text) = std::str::from_utf8(data) {
                                 let _ = events.send(MeshEvent::Status(format!(
                                     "Mensagem P2P de {short}: {text}"
@@ -289,6 +296,7 @@ fn start_media_channel(
             }
         }
         subscribed.store(false, Ordering::Release);
+        let _ = events.send(MeshEvent::ViewerChanged { peer: peer.clone(), watching: false });
         let _ = events.send(MeshEvent::StreamAvailability { peer: peer.clone(), live: false });
         playback.remove(&peer);
         let _ = events.send(MeshEvent::Status(format!("Canal P2P encerrado: {short}")));
@@ -423,13 +431,19 @@ fn start_screen_channel(
                 }
             };
             let mut decoded = 0u64;
+            let mut window_decoded = 0u64;
+            let mut window_decode_time = Duration::ZERO;
+            let mut window_started = std::time::Instant::now();
             while let Some(nals) = h264_rx.blocking_recv() {
+                let decode_started = std::time::Instant::now();
                 match decoder.decode(&nals) {
                     Ok(Some(frame)) => {
                         let (width, height) = frame.dimensions();
                         if width == 0 || height == 0 || width > 2560 || height > 1440 { continue; }
                         let mut rgb = vec![0u8; frame.rgb8_len()];
                         frame.write_rgb8(&mut rgb);
+                        window_decode_time += decode_started.elapsed();
+                        window_decoded += 1;
                         decoded += 1;
                         if decoded == 1 {
                             let _ = decode_events.send(MeshEvent::Status(format!(
@@ -441,6 +455,19 @@ fn start_screen_channel(
                             peer: decode_peer.clone(), width: width as u32,
                             height: height as u32, rgb,
                         });
+                        if window_started.elapsed() >= Duration::from_secs(5) {
+                            let secs = window_started.elapsed().as_secs_f64();
+                            let avg_ms = window_decode_time.as_secs_f64() * 1000.0
+                                / window_decoded.max(1) as f64;
+                            let _ = decode_events.send(MeshEvent::Status(format!(
+                                "VIDEO DECODER <- {}: {:.1} FPS decodificados; tempo medio {:.1}ms/quadro (inclui RGB)",
+                                &decode_peer[..decode_peer.len().min(8)],
+                                window_decoded as f64 / secs, avg_ms,
+                            )));
+                            window_decoded = 0;
+                            window_decode_time = Duration::ZERO;
+                            window_started = std::time::Instant::now();
+                        }
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -455,6 +482,14 @@ fn start_screen_channel(
         });
         let mut frame_id: u32 = 0;
         let mut errors = 0u32;
+        let mut frames_sent = 0u64;
+        let mut frames_dropped = 0u64;
+        let mut frames_received = 0u64;
+        let mut report = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        report.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 event = channel.poll() => {
@@ -471,10 +506,12 @@ fn start_screen_channel(
                                 continue;
                             } else if data.starts_with(b"VSH1") {
                                 if let Some(h264) = h264_assembler.push(data) {
+                                    frames_received += 1;
                                     // Se o decoder nao acompanhar, quadros antigos sao descartados.
                                     let _ = h264_tx.try_send(h264);
                                 }
                             } else if let Some(jpeg) = assembler.push(data) {
+                                frames_received += 1;
                                 let _ = events.send(MeshEvent::ScreenFrame { peer: peer.clone(), jpeg });
                             }
                         }
@@ -486,7 +523,10 @@ fn start_screen_channel(
                     match packet {
                         Ok(mut data) => {
                             // Nunca acumular quadros antigos se a rede estiver lenta.
-                            while let Ok(next) = outgoing.try_recv() { data = next; }
+                            while let Ok(next) = outgoing.try_recv() {
+                                frames_dropped += 1;
+                                data = next;
+                            }
                             if data.as_slice() == b"VSS0" {
                                 let _ = channel.send(BytesMut::from(data.as_slice())).await;
                                 continue;
@@ -500,6 +540,7 @@ fn start_screen_channel(
                                 screen::chunks(frame_id, &data)
                             };
                             if let Some(parts) = parts {
+                                let mut delivered = true;
                                 for part in parts {
                                     // Limitar o tempo de espera e manter a voz responsiva.
                                     let result = tokio::time::timeout(
@@ -507,6 +548,7 @@ fn start_screen_channel(
                                         channel.send(BytesMut::from(part.as_slice())),
                                     ).await;
                                     if !matches!(result, Ok(Ok(()))) {
+                                        delivered = false;
                                         errors += 1;
                                         if errors == 1 {
                                             let _ = events.send(MeshEvent::Status(format!(
@@ -516,11 +558,37 @@ fn start_screen_channel(
                                         break;
                                     }
                                 }
+                                if delivered { frames_sent += 1; }
+                                else { frames_dropped += 1; }
+                            } else {
+                                frames_dropped += 1;
                             }
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            frames_dropped += skipped;
+                            continue;
+                        },
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
+                }
+                _ = report.tick() => {
+                    // Diagnostico por PEER. A origem e codificada uma vez e depois
+                    // replicada pela malha Mesh para cada espectador.
+                    if ready && subscribed.load(Ordering::Acquire) {
+                        let _ = events.send(MeshEvent::Status(format!(
+                            "VIDEO ENVIO -> {short}: {:.1} FPS quadros completos, {:.1} FPS descartados/sobrescritos",
+                            frames_sent as f64 / 5.0,
+                            frames_dropped as f64 / 5.0,
+                        )));
+                    } else if ready && view_target.borrow().as_deref() == Some(peer.as_str()) {
+                        let _ = events.send(MeshEvent::Status(format!(
+                            "VIDEO RECEPCAO <- {short}: {:.1} FPS quadros reagrupados (antes do decoder)",
+                            frames_received as f64 / 5.0,
+                        )));
+                    }
+                    frames_sent = 0;
+                    frames_dropped = 0;
+                    frames_received = 0;
                 }
             }
         }

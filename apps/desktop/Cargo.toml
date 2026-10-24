@@ -26,3 +26,6 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 [target.'cfg(windows)'.dependencies]
 xcap = "=0.9.8"
 wasapi = "=0.26.0"
+# Captura WGC + Media Foundation H.264 por hardware no proprio processo Rust.
+# Sem ffmpeg.exe. Requer Windows 10 2004+ e encoder de hardware compativel.
+moq-video = { version = "=0.1.16", features = ["capture"] }
