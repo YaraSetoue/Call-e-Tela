@@ -1,7 +1,8 @@
-//! Captura e transmissao de tela MVP. Windows: XCap + JPEG.
-//! Perfil atual 1280x720, ate 15 FPS. Para producao: H.264/RTP + GPU.
+//! Captura da tela Windows + H.264 (OpenH264 software), com fallback JPEG.
+//! 720p 15 fps, canal WebRTC existente. Audio da tela permanece independente.
 use std::{sync::{Arc, atomic::{AtomicBool, Ordering}}, thread, time::{Duration, Instant}};
 use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, ColorType, DynamicImage};
+use openh264::{OpenH264API, encoder::{BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, UsageType}, formats::{RgbSliceU8, YUVBuffer}};
 use tokio::sync::{broadcast, mpsc};
 use crate::p2p::MeshEvent;
 
@@ -9,8 +10,8 @@ pub const CAP_WIDTH: u32 = 1280;
 pub const CAP_HEIGHT: u32 = 720;
 pub const CAP_FPS: u32 = 15;
 pub const CHUNK_BYTES: usize = 8 * 1024;
-pub const MAX_FRAME_BYTES: usize = 350_000;
-pub const MAX_CHUNKS: usize = 48;
+pub const MAX_FRAME_BYTES: usize = 1_000_000;
+pub const MAX_CHUNKS: usize = 128;
 pub const HEADER_SIZE: usize = 12;
 
 /// Perfil planejado, nao habilitado na interface nesta etapa.
@@ -46,45 +47,104 @@ impl CaptureHandle {
                 let _ = events.send(MeshEvent::Status("Monitor indisponivel ao iniciar captura".into()));
                 return;
             };
+            // Um encoder por transmissao. IDR a cada 2s permite que novos
+            // participantes comecem a receber mesmo apos a captura iniciar.
+            let config = EncoderConfig::new()
+                .usage_type(UsageType::ScreenContentRealTime)
+                .bitrate(BitRate::from_bps(2_000_000))
+                .skip_frames(true)
+                .adaptive_quantization(false)
+                .background_detection(false)
+                .max_frame_rate(FrameRate::from_hz(CAP_FPS as f32))
+                .intra_frame_period(IntraFramePeriod::from_num_frames(CAP_FPS * 2));
+            let mut h264 = if std::env::var("VOICE_VIDEO_CODEC").as_deref() == Ok("jpeg") {
+                let _ = events.send(MeshEvent::Status(
+                    "Video em modo JPEG (VOICE_VIDEO_CODEC=jpeg)".into(),
+                ));
+                None
+            } else {
+                match Encoder::with_api_config(OpenH264API::from_source(), config) {
+                    Ok(value) => {
+                        let _ = events.send(MeshEvent::Status(
+                            "Video H.264 OpenH264 iniciado: 720p/15 FPS, ~2 Mbps (software)".into(),
+                        ));
+                        Some(value)
+                    }
+                    Err(error) => {
+                        let _ = events.send(MeshEvent::Status(format!(
+                            "H.264 indisponivel ({error}); usando JPEG como fallback"
+                        )));
+                        None
+                    }
+                }
+            };
             let duration = Duration::from_nanos(1_000_000_000 / CAP_FPS as u64);
             let mut failures = 0u32;
+            let mut encoded_count = 0u64;
             while !stopped.load(Ordering::Relaxed) {
                 let started = Instant::now();
-                let result = (|| -> Result<Vec<u8>, String> {
+                let result = (|| -> Result<(), String> {
                     let raw = mon.capture_image().map_err(|e| e.to_string())?;
-                    let img = DynamicImage::ImageRgba8(raw)
+                    let image = DynamicImage::ImageRgba8(raw)
                         .resize(CAP_WIDTH, CAP_HEIGHT, FilterType::Triangle).to_rgb8();
-                    let mut data = Vec::with_capacity(65_536);
-                    let mut encoder = JpegEncoder::new_with_quality(&mut data, 48);
-                    encoder.encode(img.as_raw(), img.width(), img.height(), ColorType::Rgb8.into())
-                        .map_err(|e| e.to_string())?;
-                    Ok(data)
-                })();
-                match result {
-                    Ok(jpeg) if jpeg.len() <= MAX_FRAME_BYTES => {
-                        failures = 0;
-                        let _ = outgoing.send(jpeg.clone());
-                        let _ = events.send(MeshEvent::ScreenFrame {
-                            peer: "__local__".to_owned(), jpeg,
-                        });
-                    }
-                    Ok(jpeg) => {
-                        failures += 1;
-                        if failures == 1 {
-                            let _ = events.send(MeshEvent::Status(format!(
-                                "Quadro de tela muito grande ({} bytes); quadro descartado", jpeg.len()
-                            )));
+                    let (width, height) = image.dimensions();
+                    let bytes = image.as_raw();
+
+                    if let Some(encoder) = h264.as_mut() {
+                        let rgb = RgbSliceU8::new(bytes, (width as usize, height as usize));
+                        let yuv = YUVBuffer::from_rgb_source(rgb);
+                        let bitstream = encoder.encode(&yuv).map_err(|e| e.to_string())?;
+                        let compressed = bitstream.to_vec();
+                        if !compressed.is_empty() && compressed.len() <= MAX_FRAME_BYTES {
+                            let mut message = Vec::with_capacity(4 + compressed.len());
+                            // Marcador apenas INTERNO para escolher o tipo de pacote.
+                            message.extend_from_slice(b"VSHF");
+                            message.extend_from_slice(&compressed);
+                            let _ = outgoing.send(message);
+                            encoded_count += 1;
+                            if encoded_count == 1 {
+                                let _ = events.send(MeshEvent::Status(format!(
+                                    "Primeiro quadro H.264 enviado ({} bytes)", compressed.len(),
+                                )));
+                            }
+                        } else if compressed.len() > MAX_FRAME_BYTES {
+                            return Err(format!("H.264 quadro excede limite: {} bytes", compressed.len()));
+                        }
+                    } else {
+                        let mut jpeg = Vec::with_capacity(65_536);
+                        let mut encoder = JpegEncoder::new_with_quality(&mut jpeg, 48);
+                        encoder.encode(bytes, width, height, ColorType::Rgb8.into())
+                            .map_err(|e| e.to_string())?;
+                        if jpeg.len() <= MAX_FRAME_BYTES {
+                            let _ = outgoing.send(jpeg);
                         }
                     }
+                    // Previa local nao precisa recodificar: usa RGB da captura.
+                    let _ = events.send(MeshEvent::ScreenRgbFrame {
+                        peer: "__local__".into(), width, height, rgb: image.into_raw(),
+                    });
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => failures = 0,
                     Err(e) => {
                         failures += 1;
-                        if failures == 1 {
-                            let _ = events.send(MeshEvent::Status(format!("Falha capturando tela: {e}")));
+                        if failures == 1 || failures % 150 == 0 {
+                            let _ = events.send(MeshEvent::Status(format!(
+                                "Falha capturando/codificando video: {e}"
+                            )));
+                        }
+                        if failures == 3 && h264.is_some() {
+                            h264 = None;
+                            let _ = events.send(MeshEvent::Status(
+                                "H.264 falhou repetidamente; alternando para JPEG".into(),
+                            ));
                         }
                     }
                 }
                 if let Some(wait) = duration.checked_sub(started.elapsed()) { thread::sleep(wait); }
             }
+
         });
         Ok(Self { stop })
     }
@@ -95,12 +155,21 @@ impl Drop for CaptureHandle {
 
 /// Pacote de JPEG: VSS1 + frame_id(u32 BE) + index(u16 BE) + count(u16 BE) + dados.
 pub fn chunks(frame_id: u32, jpeg: &[u8]) -> Option<Vec<Vec<u8>>> {
+    chunks_with_magic(*b"VSS1", frame_id, jpeg)
+}
+
+/// Quadros H.264 Annex-B sao fragmentados com VSH1 (12 bytes de cabecalho).
+pub fn chunks_h264(frame_id: u32, h264: &[u8]) -> Option<Vec<Vec<u8>>> {
+    chunks_with_magic(*b"VSH1", frame_id, h264)
+}
+
+fn chunks_with_magic(magic: [u8; 4], frame_id: u32, jpeg: &[u8]) -> Option<Vec<Vec<u8>>> {
     if jpeg.len() > MAX_FRAME_BYTES || jpeg.is_empty() { return None; }
     let total = jpeg.len().div_ceil(CHUNK_BYTES);
     if total > MAX_CHUNKS { return None; }
     Some(jpeg.chunks(CHUNK_BYTES).enumerate().map(|(i, payload)| {
         let mut result = Vec::with_capacity(HEADER_SIZE + payload.len());
-        result.extend_from_slice(b"VSS1");
+        result.extend_from_slice(&magic);
         result.extend_from_slice(&frame_id.to_be_bytes());
         result.extend_from_slice(&(i as u16).to_be_bytes());
         result.extend_from_slice(&(total as u16).to_be_bytes());
@@ -110,6 +179,7 @@ pub fn chunks(frame_id: u32, jpeg: &[u8]) -> Option<Vec<Vec<u8>>> {
 }
 
 pub struct Reassembler {
+    magic: [u8; 4],
     id: Option<u32>,
     parts: Vec<Option<Vec<u8>>>,
     received: usize,
@@ -118,10 +188,16 @@ pub struct Reassembler {
 }
 impl Reassembler {
     pub fn new() -> Self {
-        Self { id: None, parts: Vec::new(), received: 0, bytes: 0, since: Instant::now() }
+        Self::new_with_magic(*b"VSS1")
+    }
+    pub fn new_h264() -> Self {
+        Self::new_with_magic(*b"VSH1")
+    }
+    fn new_with_magic(magic: [u8;4]) -> Self {
+        Self { magic, id: None, parts: Vec::new(), received: 0, bytes: 0, since: Instant::now() }
     }
     pub fn push(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
-        if packet.len() < HEADER_SIZE || &packet[..4] != b"VSS1" { return None; }
+        if packet.len() < HEADER_SIZE || packet[..4] != self.magic { return None; }
         let id = u32::from_be_bytes(packet[4..8].try_into().ok()?);
         let index = u16::from_be_bytes(packet[8..10].try_into().ok()?) as usize;
         let total = u16::from_be_bytes(packet[10..12].try_into().ok()?) as usize;
@@ -148,5 +224,37 @@ impl Reassembler {
         self.id = None;
         self.parts.clear();
         Some(jpeg)
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reassemble_h264_and_jpeg_with_distinct_magics() {
+        let h264 = vec![0x7bu8; CHUNK_BYTES * 2 + 23];
+        let pieces = chunks_h264(42, &h264).unwrap();
+        assert_eq!(pieces.len(), 3);
+        let mut decoder = Reassembler::new_h264();
+        let mut jpeg_decoder = Reassembler::new();
+        assert!(jpeg_decoder.push(&pieces[0]).is_none());
+        for part in pieces.iter().take(2) {
+            assert!(decoder.push(part).is_none());
+        }
+        assert_eq!(decoder.push(&pieces[2]), Some(h264));
+    }
+
+    #[test]
+    fn oversized_frame_and_bad_chunks_are_rejected() {
+        assert!(chunks_h264(1, &vec![0x01; MAX_FRAME_BYTES + 1]).is_none());
+        assert!(chunks_h264(1, &[]).is_none());
+        let mut assembler = Reassembler::new_h264();
+        assert!(assembler.push(b"VSH1").is_none());
+        let mut wrong = chunks_h264(2, &[1, 2, 3]).unwrap().remove(0);
+        wrong[10] = 0xff;
+        wrong[11] = 0xff;
+        assert!(assembler.push(&wrong).is_none());
     }
 }

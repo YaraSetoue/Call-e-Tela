@@ -19,7 +19,9 @@ cpal = "=0.16.0"
 opus = "=0.4.0"
 bytes = "1"
 
-# MVP de tela Windows: captura XCap e quadros JPEG. Futuro: H.264/RTP.
+# Video H.264 OpenH264 por software. JPEG permanece como fallback.
+openh264 = "=0.9.8"
+# Captura Windows (XCap), JPEG apenas para fallback.
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 [target.'cfg(windows)'.dependencies]
 xcap = "=0.9.8"

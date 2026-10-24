@@ -3,7 +3,7 @@ mod p2p;
 mod screen;
 mod screen_audio;
 
-use std::{collections::HashMap, sync::{Arc, atomic::{AtomicBool, Ordering}}};
+use std::{collections::{HashMap, HashSet}, sync::{Arc, atomic::{AtomicBool, Ordering}}};
 
 use futures_util::{SinkExt, StreamExt};
 use p2p::{Mesh, MeshEvent};
@@ -22,6 +22,10 @@ slint::slint! {
         id: string,
         name: string,
         volume: float,
+    }
+    export struct LiveStreamRow {
+        id: string,
+        name: string,
     }
 
     export component MainWindow inherits Window {
@@ -59,6 +63,8 @@ slint::slint! {
         in-out property <string> screen-status: "Nenhuma tela sendo compartilhada";
         in-out property <[string]> screen-monitors: ["Monitor principal"];
         in-out property <int> screen-monitor-index: 0;
+        in-out property <[LiveStreamRow]> live-streams: [];
+        in-out property <string> watching-stream-id: "";
 
         callback create-room();
         callback join-room();
@@ -75,6 +81,8 @@ slint::slint! {
         callback stop-screen();
         callback select-screen-monitor(int);
         callback refresh-screen-monitors();
+        callback watch-screen(string);
+        callback leave-screen();
 
         VerticalLayout {
             spacing: 0px;
@@ -199,6 +207,24 @@ slint::slint! {
                                 Text { text: "MICROFONE"; font-size: 12px; font-weight: 600; color: Theme.muted; }
                                 Text { text: root.microphone-meter; color: Theme.text; font-size: 15px; wrap: word-wrap; }
                             }
+                            Rectangle { height: 1px; background: Theme.border; }
+                            Text { text: "TRANSMISSOES AO VIVO"; color: Theme.muted; font-size: 12px; font-weight: 600; }
+                            if root.live-streams.length == 0 : Text {
+                                text: "Ninguem esta compartilhando a tela."; color: Theme.muted; font-size: 12px;
+                            }
+                            for stream in root.live-streams : HorizontalLayout {
+                                spacing: 8px;
+                                Text { text: stream.name; color: Theme.text; horizontal-stretch: 1; }
+                                Button {
+                                    text: root.watching-stream-id == stream.id ? "Assistindo" : "Assistir";
+                                    enabled: root.watching-stream-id != stream.id;
+                                    clicked => { root.watch-screen(stream.id); }
+                                }
+                            }
+                            if root.watching-stream-id != "" : Button {
+                                text: "Sair da transmissao";
+                                clicked => { root.leave-screen(); }
+                            }
                             Rectangle { background: transparent; vertical-stretch: 1; }
                             Text {
                                 text: "Use fones de ouvido para evitar eco durante os testes.";
@@ -259,6 +285,26 @@ slint::slint! {
                              spacing: 10px;
                              Text { text: "Compartilhamento de tela"; font-size: 22px; font-weight: 600; color: Theme.text; }
                              Text { text: "720p (ate 1280x720) - 15 FPS | MVP"; color: Theme.muted; font-size: 13px; }
+                             Text { text: "TRANSMISSOES DISPONIVEIS"; color: Theme.muted; font-size: 12px; font-weight: 600; }
+                             if root.live-streams.length == 0 : Text {
+                                 text: "Nenhuma transmissao ativa no momento.";
+                                 color: Theme.muted; font-size: 12px;
+                             }
+                             for stream in root.live-streams : HorizontalLayout {
+                                 spacing: 10px;
+                                 Text { text: stream.name + " esta ao vivo"; color: Theme.text; horizontal-stretch: 1; }
+                                 Button {
+                                     text: root.watching-stream-id == stream.id ? "Assistindo" : "Assistir transmissao";
+                                     enabled: root.watching-stream-id != stream.id;
+                                     clicked => { root.watch-screen(stream.id); }
+                                 }
+                             }
+                             if root.watching-stream-id != "" : Button {
+                                 text: "Sair da transmissao (continuar na chamada)";
+                                 clicked => { root.leave-screen(); }
+                             }
+                             Rectangle { height: 1px; background: Theme.border; }
+                             Text { text: "MINHA TRANSMISSAO"; color: Theme.muted; font-size: 12px; font-weight: 600; }
                              HorizontalLayout {
                                  spacing: 10px;
                                  monitor_picker := ComboBox {
@@ -290,7 +336,7 @@ slint::slint! {
                                      image-fit: contain;
                                  }
                              }
-                             Text { text: "Versao inicial experimental: apenas um apresentador por vez. Futuro: H.264/RTP e perfis de qualidade.";
+                             Text { text: "Entrar/sair da transmissao nao desconecta voce da voz. Nesta versao, assista a uma tela por vez.";
                                     font-size: 12px; color: Theme.muted; wrap: word-wrap; }
                          }
 
@@ -393,6 +439,22 @@ fn update_peer_volumes(
     });
 }
 
+fn update_live_streams(
+    weak: &slint::Weak<MainWindow>,
+    peers: &HashMap<String, String>,
+    live: &std::collections::HashSet<String>,
+) {
+    let mut rows: Vec<LiveStreamRow> = live.iter().filter_map(|id| {
+        peers.get(id).map(|name| LiveStreamRow {
+            id: id.clone().into(), name: name.clone().into(),
+        })
+    }).collect();
+    rows.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+    let _ = weak.upgrade_in_event_loop(move |ui| {
+        ui.set_live_streams(slint::ModelRc::new(slint::VecModel::from(rows)));
+    });
+}
+
 fn update_voice_stats(
     weak: &slint::Weak<MainWindow>,
     peers: &HashMap<String, String>,
@@ -423,9 +485,16 @@ async fn connection(
     mut speaker_test: watch::Receiver<u64>,
      mut screen_state: watch::Receiver<Option<usize>>,
     mut system_audio_state: watch::Receiver<bool>,
+    mut watch_state: watch::Receiver<Option<String>>,
+    watch_tx: watch::Sender<Option<String>>,
     mut cancel: watch::Receiver<bool>,
     playback: PlaybackBus,
 ) {
+    watch_tx.send_replace(None);
+    let _ = weak.upgrade_in_event_loop(|ui| {
+        ui.set_watching_stream_id("".into());
+        ui.set_live_streams(slint::ModelRc::new(slint::VecModel::from(Vec::<LiveStreamRow>::new())));
+    });
     update_ui(&weak, None, "Conectando ao servidor...".into(), "".into(), "".into());
     let (socket, _) = match connect_async(&command.url).await {
         Ok(pair) => pair,
@@ -458,6 +527,7 @@ async fn connection(
     audio.output(*selected_output.borrow());
     audio.capture(*mic_state.borrow(), *selected_mic.borrow());
     let mut peers: HashMap<String, String> = HashMap::new();
+    let mut live_streams: HashSet<String> = HashSet::new();
     let mut voice_stats: HashMap<String, (u64, u64)> = HashMap::new();
     let mut log: Vec<String> = Vec::new();
      let mut screen_capture: Option<screen::CaptureHandle> = None;
@@ -482,9 +552,28 @@ async fn connection(
                 if changed.is_err() { break; }
                 audio.output(*selected_output.borrow());
             }
+            changed = watch_state.changed() => {
+                if changed.is_err() { break; }
+                let target = watch_state.borrow().clone();
+                mesh.set_view_target(target.clone());
+                screen_owner = target.clone();
+                decode_busy.store(false, Ordering::Release);
+                let label = target.as_ref().and_then(|id| peers.get(id)).cloned();
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_screen_frame(slint::Image::default());
+                    ui.set_watching_stream_id(target.clone().unwrap_or_default().into());
+                    if let Some(label) = label {
+                        ui.set_screen_status(format!("Entrando na transmissao de {label}...").into());
+                    } else {
+                        ui.set_screen_status("Voce saiu da transmissao. A voz continua ativa.".into());
+                    }
+                });
+                // O fluxo Opus do microfone e a chamada P2P permanecem ativos.
+            }
              changed = screen_state.changed() => {
                  if changed.is_err() { break; }
                  // Interrompe captura anterior antes de iniciar outro monitor.
+                 mesh.set_local_screen_live(false);
                  drop(system_audio_capture.take());
                  drop(screen_capture.take());
                  let _ = screen_frames_tx.send(b"VSS0".to_vec());
@@ -494,6 +583,7 @@ async fn connection(
                          match screen::CaptureHandle::start(index, screen_frames_tx.clone(), event_tx.clone()) {
                              Ok(capture) => {
                                  screen_capture = Some(capture);
+                                 mesh.set_local_screen_live(true);
                                  add_log(&mut log, "Compartilhando tela: 720p / 15 FPS".into());
                                  if *system_audio_state.borrow() {
                                      match screen_audio::CaptureHandle::start(system_audio_tx.clone(), event_tx.clone()) {
@@ -579,6 +669,10 @@ async fn connection(
                     ServerMessage::PeerLeft { peer_id } => {
                         let name = peers.remove(&peer_id).unwrap_or_else(|| "Participante".into());
                         voice_stats.remove(&peer_id);
+                        live_streams.remove(&peer_id);
+                        update_live_streams(&weak, &peers, &live_streams);
+                        let was_watching = watch_state.borrow().as_deref() == Some(peer_id.as_str());
+                        if was_watching { watch_tx.send_replace(None); }
                         status = format!("{name} saiu da sala.");
                         mesh.leave(&peer_id).await;
                     }
@@ -658,11 +752,23 @@ async fn connection(
                         voice_stats.insert(peer, (sent, received));
                         update_voice_stats(&weak, &peers, &voice_stats);
                     }
+                     MeshEvent::StreamAvailability { peer, live } => {
+                         if live { live_streams.insert(peer.clone()); }
+                         else { live_streams.remove(&peer); }
+                         update_live_streams(&weak, &peers, &live_streams);
+                         let was_watching = watch_state.borrow().as_deref() == Some(peer.as_str());
+                         if !live && was_watching { watch_tx.send_replace(None); }
+                         continue;
+                     }
                      MeshEvent::ScreenFrame { peer, jpeg } => {
                          // Um compartilhamento por vez na interface nesta etapa.
-                         if screen_owner.is_none() { screen_owner = Some(peer.clone()); }
-                         if screen_owner.as_deref() == Some(peer.as_str())
-                             && !decode_busy.swap(true, Ordering::AcqRel)
+                         let allowed = if peer == "__local__" {
+                             watch_state.borrow().is_none() && screen_capture.is_some()
+                         } else {
+                             watch_state.borrow().as_deref() == Some(peer.as_str())
+                         };
+                         if allowed { screen_owner = Some(peer.clone()); }
+                         if allowed && !decode_busy.swap(true, Ordering::AcqRel)
                          {
                              let weak_image = weak.clone();
                              let busy = decode_busy.clone();
@@ -679,6 +785,35 @@ async fn connection(
                                          ui.set_screen_status(format!("{owner_label} - 720p / 15 FPS").into());
                                      });
                                  }
+                                 busy.store(false, Ordering::Release);
+                             });
+                         }
+                         continue;
+                     }
+                     MeshEvent::ScreenRgbFrame { peer, width, height, rgb } => {
+                         let allowed = if peer == "__local__" {
+                             watch_state.borrow().is_none() && screen_capture.is_some()
+                         } else {
+                             watch_state.borrow().as_deref() == Some(peer.as_str())
+                         };
+                         if allowed { screen_owner = Some(peer.clone()); }
+                         if allowed && rgb.len() == width as usize * height as usize * 3
+                             && !decode_busy.swap(true, Ordering::AcqRel)
+                         {
+                             let pixels = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(
+                                 &rgb, width, height
+                             );
+                             let owner_label = if peer == "__local__" {
+                                 "Sua tela".to_owned()
+                             } else {
+                                 format!("Tela de {}", &peer[..peer.len().min(8)])
+                             };
+                             let busy = decode_busy.clone();
+                             let _ = weak.upgrade_in_event_loop(move |ui| {
+                                 ui.set_screen_frame(slint::Image::from_rgb8(pixels));
+                                 ui.set_screen_status(format!(
+                                     "{owner_label} - 720p / 15 FPS"
+                                 ).into());
                                  busy.store(false, Ordering::Release);
                              });
                          }
@@ -711,6 +846,9 @@ async fn connection(
             }
         }
     }
+     mesh.set_local_screen_live(false);
+     mesh.set_view_target(None);
+     watch_tx.send_replace(None);
      drop(system_audio_capture.take());
      drop(screen_capture.take());
      let _ = screen_frames_tx.send(b"VSS0".to_vec());
@@ -733,6 +871,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (output_tx, output_rx) = watch::channel(0usize);
      let (screen_tx, screen_rx) = watch::channel(None::<usize>);
      let (sysaudio_tx, sysaudio_rx) = watch::channel(false);
+     let (watch_tx, watch_rx) = watch::channel(None::<String>);
     let playback = PlaybackBus::default();
     let microphones = microphone_names();
     let microphone_model = slint::VecModel::from(microphones.into_iter()
@@ -747,6 +886,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
      )));
     let weak = ui.as_weak();
     let session_playback = playback.clone();
+    let watch_tx_for_runtime = watch_tx.clone();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().expect("Erro criando runtime Tokio");
@@ -764,8 +904,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let output = output_rx.clone();
                  let screen_state = screen_rx.clone();
                  let system_audio_state = sysaudio_rx.clone();
+                 let watch_state = watch_rx.clone();
+                 let watching_sender = watch_tx_for_runtime.clone();
                 job = Some((stop, tokio::spawn(connection(
-                     weak.clone(), command, mic, selected, output, test, screen_state, system_audio_state, cancel, session_playback.clone(),
+                     weak.clone(), command, mic, selected, output, test, screen_state, system_audio_state,
+                     watch_state, watching_sender, cancel, session_playback.clone(),
                 ))));
             }
             if let Some((stop, task)) = job {
@@ -887,7 +1030,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          if let Some(ui) = weak_start.upgrade() {
              let index = ui.get_screen_monitor_index().max(0) as usize;
              ui.set_screen_sharing(true);
-             ui.set_screen_status("Iniciando captura 720p / 15 FPS...".into());
+             ui.set_screen_status("Iniciando H.264 720p / 15 FPS...".into());
              screen_enable_tx.send_replace(Some(index));
          }
      });
@@ -897,8 +1040,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          screen_disable_tx.send_replace(None);
          if let Some(ui) = weak_stop.upgrade() {
              ui.set_screen_sharing(false);
-             ui.set_screen_status("Compartilhamento encerrado".into());
-             ui.set_screen_frame(slint::Image::default());
+             if ui.get_watching_stream_id().is_empty() {
+                 ui.set_screen_status("Compartilhamento encerrado".into());
+                 ui.set_screen_frame(slint::Image::default());
+             }
          }
      });
      let weak_pick = ui.as_weak();
@@ -917,6 +1062,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          }
      });
 
+    let watch_control = watch_tx.clone();
+    let weak_watch = ui.as_weak();
+    ui.on_watch_screen(move |peer_id| {
+        let id = peer_id.to_string();
+        watch_control.send_replace(Some(id.clone()));
+        if let Some(ui) = weak_watch.upgrade() {
+            ui.set_watching_stream_id(id.into());
+            ui.set_active_section(3);
+        }
+    });
+    let leave_control = watch_tx;
+    let weak_leave = ui.as_weak();
+    ui.on_leave_screen(move || {
+        leave_control.send_replace(None);
+        if let Some(ui) = weak_leave.upgrade() {
+            ui.set_watching_stream_id("".into());
+            ui.set_screen_frame(slint::Image::default());
+            ui.set_screen_status("Voce saiu da transmissao. A chamada continua.".into());
+        }
+    });
     ui.run()?;
     Ok(())
 }

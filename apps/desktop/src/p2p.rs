@@ -2,11 +2,12 @@
 //! Diagnostico: usar o canal que ja foi comprovado funcional para isolar o fluxo de voz.
 //! Esta versao usa SCTP confiavel para teste; migrar voz para RTP na etapa de qualidade.
 
-use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
+use std::{collections::HashMap, error::Error, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::Duration};
 use crate::screen::{self, Reassembler};
+use openh264::{decoder::Decoder, formats::YUVSource};
 
 use bytes::BytesMut;
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use webrtc::{
     data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit},
     peer_connection::{
@@ -27,7 +28,9 @@ pub enum MeshEvent {
     MicLevel(f32),
     VoiceStats { peer: String, sent: u64, received: u64 },
     ScreenFrame { peer: String, jpeg: Vec<u8> },
+    ScreenRgbFrame { peer: String, width: u32, height: u32, rgb: Vec<u8> },
     ScreenStopped { peer: String },
+    StreamAvailability { peer: String, live: bool },
 }
 
 #[derive(Clone)]
@@ -39,6 +42,9 @@ struct Handler {
     screen_frames: broadcast::Sender<Vec<u8>>,
     system_audio: broadcast::Sender<Vec<u8>>,
     playback: PlaybackBus,
+    subscribed: Arc<AtomicBool>,
+    local_live: watch::Receiver<bool>,
+    view_target: watch::Receiver<Option<String>>,
 }
 
 #[async_trait::async_trait]
@@ -85,13 +91,16 @@ impl PeerConnectionEventHandler for Handler {
             match data_channel.label().await {
                 Ok(name) if name == "voice-screen-jpeg-v1" => start_screen_channel(
                     me.peer, data_channel, me.events, me.screen_frames.subscribe(),
+                    me.subscribed, me.view_target,
                 ),
                 Ok(name) if name == "voice-screen-system-audio-v1" => start_system_audio_channel(
                     me.peer, data_channel, me.events, me.system_audio.subscribe(), me.playback,
+                    me.subscribed, me.view_target,
                 ),
                 Ok(name) if name == "voice-screen-test" => start_media_channel(
                     me.peer, data_channel, me.events,
-                    me.voice.subscribe(), me.playback,
+                    me.voice.subscribe(), me.playback, me.subscribed,
+                    me.local_live, me.view_target,
                 ),
                 Ok(name) => {
                     let _ = me.events.send(MeshEvent::Status(format!(
@@ -123,6 +132,9 @@ fn start_media_channel(
     events: mpsc::UnboundedSender<MeshEvent>,
     mut outgoing: broadcast::Receiver<Vec<u8>>,
     playback: PlaybackBus,
+    subscribed: Arc<AtomicBool>,
+    mut local_live: watch::Receiver<bool>,
+    mut view_target: watch::Receiver<Option<String>>,
 ) {
     tokio::spawn(async move {
         let short = peer[..peer.len().min(8)].to_owned();
@@ -161,11 +173,11 @@ fn start_media_channel(
                             let _ = events.send(MeshEvent::VoiceStats {
                                 peer: peer.clone(), sent: packets_sent, received: packets_received,
                             });
-                            if let Err(e) = channel.send_text("P2P aberto: teste e voz Opus no mesmo canal").await {
-                                let _ = events.send(MeshEvent::Status(format!(
-                                    "Falha no teste P2P para {short}: {e}"
-                                )));
-                            }
+                            // Estado inicial para quem entrou depois de o stream comecar.
+                            let live = *local_live.borrow();
+                            let _ = channel.send_text(if live { "VSC1:LIVE" } else { "VSC1:OFF" }).await;
+                            let watching = view_target.borrow().as_deref() == Some(peer.as_str());
+                            let _ = channel.send_text(if watching { "VSC1:WATCH" } else { "VSC1:UNWATCH" }).await;
                         }
                         Some(DataChannelEvent::OnMessage(packet)) => {
                             let data = packet.data.as_ref();
@@ -188,6 +200,16 @@ fn start_media_channel(
                                         )));
                                     }
                                 }
+                            } else if data == b"VSC1:LIVE" || data == b"VSC1:OFF" {
+                                let _ = events.send(MeshEvent::StreamAvailability {
+                                    peer: peer.clone(), live: data == b"VSC1:LIVE",
+                                });
+                            } else if data == b"VSC1:WATCH" {
+                                subscribed.store(true, Ordering::Release);
+                                let _ = events.send(MeshEvent::Status(format!("{short} entrou na transmissao")));
+                            } else if data == b"VSC1:UNWATCH" {
+                                subscribed.store(false, Ordering::Release);
+                                let _ = events.send(MeshEvent::Status(format!("{short} saiu da transmissao")));
                             } else if let Ok(text) = std::str::from_utf8(data) {
                                 let _ = events.send(MeshEvent::Status(format!(
                                     "Mensagem P2P de {short}: {text}"
@@ -201,6 +223,20 @@ fn start_media_channel(
                         }
                         Some(DataChannelEvent::OnClose) | None => break,
                         _ => {}
+                    }
+                }
+                changed = local_live.changed() => {
+                    if changed.is_err() { break; }
+                    if opened {
+                        let live = *local_live.borrow();
+                        let _ = channel.send_text(if live { "VSC1:LIVE" } else { "VSC1:OFF" }).await;
+                    }
+                }
+                changed = view_target.changed() => {
+                    if changed.is_err() { break; }
+                    if opened {
+                        let watching = view_target.borrow().as_deref() == Some(peer.as_str());
+                        let _ = channel.send_text(if watching { "VSC1:WATCH" } else { "VSC1:UNWATCH" }).await;
                     }
                 }
                 packet = outgoing.recv(), if opened => {
@@ -252,6 +288,8 @@ fn start_media_channel(
                 }
             }
         }
+        subscribed.store(false, Ordering::Release);
+        let _ = events.send(MeshEvent::StreamAvailability { peer: peer.clone(), live: false });
         playback.remove(&peer);
         let _ = events.send(MeshEvent::Status(format!("Canal P2P encerrado: {short}")));
     });
@@ -265,6 +303,8 @@ fn start_system_audio_channel(
     events: mpsc::UnboundedSender<MeshEvent>,
     mut outgoing: broadcast::Receiver<Vec<u8>>,
     playback: PlaybackBus,
+    subscribed: Arc<AtomicBool>,
+    mut view_target: watch::Receiver<Option<String>>,
 ) {
     tokio::spawn(async move {
         let short = peer[..peer.len().min(8)].to_owned();
@@ -289,7 +329,8 @@ fn start_system_audio_channel(
                         }
                         Some(DataChannelEvent::OnMessage(packet)) => {
                             let data = packet.data.as_ref();
-                            if data.len() > 8 && data.starts_with(b"VSD1") {
+                            if view_target.borrow().as_deref() == Some(peer.as_str())
+                                && data.len() > 8 && data.starts_with(b"VSD1") {
                                 // PeerDecoder trabalha com o mesmo envelope do Opus do microfone;
                                 // cabeçalho alterado apenas na memoria, nunca no fluxo de rede.
                                 let mut adapted = data.to_vec();
@@ -319,9 +360,16 @@ fn start_system_audio_channel(
                         _ => {}
                     }
                 }
+                changed = view_target.changed() => {
+                    if changed.is_err() { break; }
+                    if view_target.borrow().as_deref() != Some(peer.as_str()) {
+                        playback.remove(&bus_key);
+                    }
+                }
                 packet = outgoing.recv(), if opened => {
                     match packet {
                         Ok(data) => {
+                            if !subscribed.load(Ordering::Acquire) { continue; }
                             // Se houve congestionamento, preferir o quadro mais novo.
                             match channel.try_send(BytesMut::from(data.as_slice())).await {
                                 Ok(()) => {}
@@ -351,11 +399,60 @@ fn start_screen_channel(
     channel: Arc<dyn DataChannel>,
     events: mpsc::UnboundedSender<MeshEvent>,
     mut outgoing: broadcast::Receiver<Vec<u8>>,
+    subscribed: Arc<AtomicBool>,
+    view_target: watch::Receiver<Option<String>>,
 ) {
     tokio::spawn(async move {
         let short = peer[..peer.len().min(8)].to_owned();
         let mut ready = false;
         let mut assembler = Reassembler::new();
+        let mut h264_assembler = Reassembler::new_h264();
+        // Decodificacao fora do runtime Tokio: a voz nunca aguarda a CPU do video.
+        // Fila limitada: descarta frames atrasados, com recuperacao no proximo IDR.
+        let (h264_tx, mut h264_rx) = mpsc::channel::<Vec<u8>>(4);
+        let decode_events = events.clone();
+        let decode_peer = peer.clone();
+        std::thread::spawn(move || {
+            let mut decoder = match Decoder::new() {
+                Ok(decoder) => decoder,
+                Err(e) => {
+                    let _ = decode_events.send(MeshEvent::Status(format!(
+                        "Nao foi possivel iniciar decoder H.264: {e}"
+                    )));
+                    return;
+                }
+            };
+            let mut decoded = 0u64;
+            while let Some(nals) = h264_rx.blocking_recv() {
+                match decoder.decode(&nals) {
+                    Ok(Some(frame)) => {
+                        let (width, height) = frame.dimensions();
+                        if width == 0 || height == 0 || width > 2560 || height > 1440 { continue; }
+                        let mut rgb = vec![0u8; frame.rgb8_len()];
+                        frame.write_rgb8(&mut rgb);
+                        decoded += 1;
+                        if decoded == 1 {
+                            let _ = decode_events.send(MeshEvent::Status(format!(
+                                "Primeiro quadro H.264 DECODIFICADO de {}",
+                                &decode_peer[..decode_peer.len().min(8)]
+                            )));
+                        }
+                        let _ = decode_events.send(MeshEvent::ScreenRgbFrame {
+                            peer: decode_peer.clone(), width: width as u32,
+                            height: height as u32, rgb,
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        if decoded == 0 {
+                            let _ = decode_events.send(MeshEvent::Status(format!(
+                                "Decoder H.264 aguarda quadro valido: {e}"
+                            )));
+                        }
+                    }
+                }
+            }
+        });
         let mut frame_id: u32 = 0;
         let mut errors = 0u32;
         loop {
@@ -364,12 +461,19 @@ fn start_screen_channel(
                     match event {
                         Some(DataChannelEvent::OnOpen) => {
                             ready = true;
-                            let _ = events.send(MeshEvent::Status(format!("Tela P2P disponivel com {short}")));
+                            let _ = events.send(MeshEvent::Status(format!("Canal de video P2P disponivel com {short} (JPEG/H.264)")));
                         }
                         Some(DataChannelEvent::OnMessage(packet)) => {
                             let data = packet.data.as_ref();
                             if data == b"VSS0" {
                                 let _ = events.send(MeshEvent::ScreenStopped { peer: peer.clone() });
+                            } else if view_target.borrow().as_deref() != Some(peer.as_str()) {
+                                continue;
+                            } else if data.starts_with(b"VSH1") {
+                                if let Some(h264) = h264_assembler.push(data) {
+                                    // Se o decoder nao acompanhar, quadros antigos sao descartados.
+                                    let _ = h264_tx.try_send(h264);
+                                }
                             } else if let Some(jpeg) = assembler.push(data) {
                                 let _ = events.send(MeshEvent::ScreenFrame { peer: peer.clone(), jpeg });
                             }
@@ -387,8 +491,15 @@ fn start_screen_channel(
                                 let _ = channel.send(BytesMut::from(data.as_slice())).await;
                                 continue;
                             }
+                            // Nao consumir banda nem CPU de rede para nao espectadores.
+                            if !subscribed.load(Ordering::Acquire) { continue; }
                             frame_id = frame_id.wrapping_add(1);
-                            if let Some(parts) = screen::chunks(frame_id, &data) {
+                            let parts = if data.starts_with(b"VSHF") {
+                                screen::chunks_h264(frame_id, &data[4..])
+                            } else {
+                                screen::chunks(frame_id, &data)
+                            };
+                            if let Some(parts) = parts {
                                 for part in parts {
                                     // Limitar o tempo de espera e manter a voz responsiva.
                                     let result = tokio::time::timeout(
@@ -419,6 +530,7 @@ fn start_screen_channel(
 
 struct Link {
     connection: Arc<dyn PeerConnection>,
+    subscribed: Arc<AtomicBool>,
     remote_ready: bool,
     pending_ice: Vec<RTCIceCandidateInit>,
 }
@@ -433,6 +545,8 @@ pub struct Mesh {
     screen_frames: broadcast::Sender<Vec<u8>>,
     system_audio: broadcast::Sender<Vec<u8>>,
     playback: PlaybackBus,
+    local_live: watch::Sender<bool>,
+    view_target: watch::Sender<Option<String>>,
 }
 
 impl Mesh {
@@ -444,7 +558,10 @@ impl Mesh {
         system_audio: broadcast::Sender<Vec<u8>>,
         playback: PlaybackBus,
     ) -> Self {
+        let (local_live, _) = watch::channel(false);
+        let (view_target, _) = watch::channel(None::<String>);
         Self {
+            local_live, view_target,
             links: Mutex::new(HashMap::new()),
             early_ice: Mutex::new(HashMap::new()), signaling, events, voice, screen_frames, system_audio, playback,
             ice_servers: Mutex::new(vec![RTCIceServer {
@@ -452,6 +569,14 @@ impl Mesh {
                 ..Default::default()
             }]),
         }
+    }
+
+    pub fn set_local_screen_live(&self, live: bool) {
+        self.local_live.send_replace(live);
+    }
+
+    pub fn set_view_target(&self, target: Option<String>) {
+        self.view_target.send_replace(target);
     }
 
     pub async fn set_turn_credentials(&self, urls: Vec<String>, username: String, credential: String) {
@@ -484,7 +609,11 @@ impl Mesh {
             builder = builder.with_ice_transport_policy(RTCIceTransportPolicy::Relay);
         }
         let config = builder.build();
+        let subscribed = Arc::new(AtomicBool::new(false));
         let handler = Handler {
+            subscribed: subscribed.clone(),
+            local_live: self.local_live.subscribe(),
+            view_target: self.view_target.subscribe(),
             peer: peer.to_owned(), events: self.events.clone(), signaling: self.signaling.clone(),
             voice: self.voice.clone(), screen_frames: self.screen_frames.clone(),
             system_audio: self.system_audio.clone(), playback: self.playback.clone(),
@@ -498,7 +627,7 @@ impl Mesh {
                 .build().await?,
         );
         let pending_ice = self.early_ice.lock().await.remove(peer).unwrap_or_default();
-        map.insert(peer.to_owned(), Link { connection: pc.clone(), remote_ready: false, pending_ice });
+        map.insert(peer.to_owned(), Link { connection: pc.clone(), subscribed, remote_ready: false, pending_ice });
         self.emit(format!("PeerConnection criada para {}", &peer[..peer.len().min(8)]));
         Ok(pc)
     }
@@ -568,24 +697,28 @@ impl Mesh {
     pub async fn offer(&self, peer: &str) -> Result<(), AnyError> {
         self.emit(format!("Comecando oferta P2P para {}", &peer[..peer.len().min(8)]));
         let pc = self.link_for(peer).await?;
+        let subscribed = self.links.lock().await.get(peer)
+            .ok_or("Link nao encontrado")?.subscribed.clone();
         // O canal de teste P2P existente passa a carregar mensagens e quadros Opus.
         // Usa o modo confiavel padrao apenas para diagnosticar o primeiro audio.
         let media_channel = pc.create_data_channel("voice-screen-test", None).await?;
         start_media_channel(peer.to_owned(), media_channel, self.events.clone(),
-            self.voice.subscribe(), self.playback.clone());
+            self.voice.subscribe(), self.playback.clone(), subscribed.clone(),
+            self.local_live.subscribe(), self.view_target.subscribe());
         let screen_channel = pc.create_data_channel("voice-screen-jpeg-v1", Some(RTCDataChannelInit {
             ordered: false,
             max_packet_life_time: Some(220),
             ..Default::default()
         })).await?;
-        start_screen_channel(peer.to_owned(), screen_channel, self.events.clone(), self.screen_frames.subscribe());
+        start_screen_channel(peer.to_owned(), screen_channel, self.events.clone(),
+            self.screen_frames.subscribe(), subscribed.clone(), self.view_target.subscribe());
         let system_audio_channel = pc.create_data_channel("voice-screen-system-audio-v1", Some(RTCDataChannelInit {
             ordered: false,
             max_packet_life_time: Some(160),
             ..Default::default()
         })).await?;
         start_system_audio_channel(peer.to_owned(), system_audio_channel, self.events.clone(),
-            self.system_audio.subscribe(), self.playback.clone());
+            self.system_audio.subscribe(), self.playback.clone(), subscribed, self.view_target.subscribe());
         self.emit(format!("DataChannel P2P criado para {}; gerando oferta", &peer[..peer.len().min(8)]));
         let offer = pc.create_offer(None).await?;
         pc.set_local_description(offer).await?;
