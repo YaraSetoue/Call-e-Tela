@@ -1,6 +1,7 @@
 mod audio;
 mod p2p;
 mod screen;
+mod screen_audio;
 
 use std::{collections::HashMap, sync::{Arc, atomic::{AtomicBool, Ordering}}};
 
@@ -53,6 +54,7 @@ slint::slint! {
         in-out property <int> active-section: 0;
         // Compartilhamento inicial: 720p a 15 FPS. Perfis futuros documentados.
         in-out property <bool> screen-sharing: false;
+        in-out property <bool> share-system-audio: false;
         in-out property <image> screen-frame;
         in-out property <string> screen-status: "Nenhuma tela sendo compartilhada";
         in-out property <[string]> screen-monitors: ["Monitor principal"];
@@ -69,6 +71,7 @@ slint::slint! {
         callback change-master-volume(float);
         callback change-peer-volume(string, float);
         callback start-screen();
+        callback toggle-screen-audio(bool);
         callback stop-screen();
         callback select-screen-monitor(int);
         callback refresh-screen-monitors();
@@ -265,6 +268,14 @@ slint::slint! {
                                  }
                                  Button { text: "Atualizar"; clicked => { root.refresh-screen-monitors(); } }
                              }
+                             Button {
+                                 text: root.share-system-audio ? "Som do computador: LIGADO" : "Som do computador: desligado";
+                                 clicked => {
+                                     root.share-system-audio = !root.share-system-audio;
+                                     root.toggle-screen-audio(root.share-system-audio);
+                                 }
+                             }
+                             Text { text: "Opcional: transmite videos e apps do Windows, sem repetir a voz da chamada. Requer Windows 11 ou Windows 10 atualizado."; color: Theme.muted; font-size: 12px; wrap: word-wrap; }
                              Text { text: root.screen-status; wrap: word-wrap; color: Theme.muted; font-size: 12px; }
                              Rectangle {
                                  background: #090909;
@@ -411,6 +422,7 @@ async fn connection(
     mut selected_output: watch::Receiver<usize>,
     mut speaker_test: watch::Receiver<u64>,
      mut screen_state: watch::Receiver<Option<usize>>,
+    mut system_audio_state: watch::Receiver<bool>,
     mut cancel: watch::Receiver<bool>,
     playback: PlaybackBus,
 ) {
@@ -438,9 +450,10 @@ async fn connection(
     let (signal_tx, mut signal_rx) = mpsc::unbounded_channel::<ClientMessage>();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<MeshEvent>();
      let (screen_frames_tx, _) = broadcast::channel::<Vec<u8>>(2);
+     let (system_audio_tx, _) = broadcast::channel::<Vec<u8>>(64);
     let audio = AudioSession::new(event_tx.clone(), playback);
     let mesh = Arc::new(Mesh::new(
-        signal_tx, event_tx.clone(), audio.frames.clone(), screen_frames_tx.clone(), audio.playback.clone(),
+        signal_tx, event_tx.clone(), audio.frames.clone(), screen_frames_tx.clone(), system_audio_tx.clone(), audio.playback.clone(),
     ));
     audio.output(*selected_output.borrow());
     audio.capture(*mic_state.borrow(), *selected_mic.borrow());
@@ -448,6 +461,7 @@ async fn connection(
     let mut voice_stats: HashMap<String, (u64, u64)> = HashMap::new();
     let mut log: Vec<String> = Vec::new();
      let mut screen_capture: Option<screen::CaptureHandle> = None;
+     let mut system_audio_capture: Option<screen_audio::CaptureHandle> = None;
      let mut screen_owner: Option<String> = None;
      let decode_busy = Arc::new(AtomicBool::new(false));
     let mut status = "Conectado ao WebSocket".to_owned();
@@ -471,7 +485,8 @@ async fn connection(
              changed = screen_state.changed() => {
                  if changed.is_err() { break; }
                  // Interrompe captura anterior antes de iniciar outro monitor.
-                 screen_capture = None;
+                 drop(system_audio_capture.take());
+                 drop(screen_capture.take());
                  let _ = screen_frames_tx.send(b"VSS0".to_vec());
                  let _ = event_tx.send(MeshEvent::ScreenStopped { peer: "__local__".to_owned() });
                  match *screen_state.borrow() {
@@ -480,6 +495,12 @@ async fn connection(
                              Ok(capture) => {
                                  screen_capture = Some(capture);
                                  add_log(&mut log, "Compartilhando tela: 720p / 15 FPS".into());
+                                 if *system_audio_state.borrow() {
+                                     match screen_audio::CaptureHandle::start(system_audio_tx.clone(), event_tx.clone()) {
+                                         Ok(handle) => { system_audio_capture = Some(handle); }
+                                         Err(err) => add_log(&mut log, format!("Som da tela indisponivel: {err}")),
+                                     }
+                                 }
                              }
                              Err(err) => {
                                  add_log(&mut log, format!("Nao foi possivel compartilhar tela: {err}"));
@@ -491,6 +512,20 @@ async fn connection(
                  }
                  update_ui(&weak, room.clone(), status.clone(), user_list(&peers), log.join("\n"));
              }
+            changed = system_audio_state.changed() => {
+                if changed.is_err() { break; }
+                // O som do sistema e independente do microfone e da captura JPEG.
+                drop(system_audio_capture.take());
+                if *system_audio_state.borrow() && screen_capture.is_some() {
+                    match screen_audio::CaptureHandle::start(system_audio_tx.clone(), event_tx.clone()) {
+                        Ok(handle) => { system_audio_capture = Some(handle); }
+                        Err(err) => add_log(&mut log, format!("Som da tela indisponivel: {err}")),
+                    }
+                } else {
+                    add_log(&mut log, "Transmissao do som do computador desligada".to_owned());
+                }
+                update_ui(&weak, room.clone(), status.clone(), user_list(&peers), log.join("\n"));
+            }
             changed = speaker_test.changed() => {
                 if changed.is_err() { break; }
                 audio.playback.test_speaker();
@@ -676,7 +711,8 @@ async fn connection(
             }
         }
     }
-     screen_capture = None;
+     drop(system_audio_capture.take());
+     drop(screen_capture.take());
      let _ = screen_frames_tx.send(b"VSS0".to_vec());
     audio.capture(false, *selected_mic.borrow());
     mesh.close_all().await;
@@ -696,6 +732,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (test_tx, test_rx) = watch::channel(0u64);
     let (output_tx, output_rx) = watch::channel(0usize);
      let (screen_tx, screen_rx) = watch::channel(None::<usize>);
+     let (sysaudio_tx, sysaudio_rx) = watch::channel(false);
     let playback = PlaybackBus::default();
     let microphones = microphone_names();
     let microphone_model = slint::VecModel::from(microphones.into_iter()
@@ -726,8 +763,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let test = test_rx.clone();
                 let output = output_rx.clone();
                  let screen_state = screen_rx.clone();
+                 let system_audio_state = sysaudio_rx.clone();
                 job = Some((stop, tokio::spawn(connection(
-                     weak.clone(), command, mic, selected, output, test, screen_state, cancel, session_playback.clone(),
+                     weak.clone(), command, mic, selected, output, test, screen_state, system_audio_state, cancel, session_playback.clone(),
                 ))));
             }
             if let Some((stop, task)) = job {
@@ -840,6 +878,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let next = (*test_tx.borrow()).wrapping_add(1);
         test_tx.send_replace(next);
     });
+     ui.on_toggle_screen_audio(move |enabled| {
+         sysaudio_tx.send_replace(enabled);
+     });
      let screen_enable_tx = screen_tx.clone();
      let weak_start = ui.as_weak();
      ui.on_start_screen(move || {

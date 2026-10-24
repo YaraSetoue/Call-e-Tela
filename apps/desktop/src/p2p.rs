@@ -37,6 +37,7 @@ struct Handler {
     signaling: mpsc::UnboundedSender<ClientMessage>,
     voice: broadcast::Sender<Vec<u8>>,
     screen_frames: broadcast::Sender<Vec<u8>>,
+    system_audio: broadcast::Sender<Vec<u8>>,
     playback: PlaybackBus,
 }
 
@@ -84,6 +85,9 @@ impl PeerConnectionEventHandler for Handler {
             match data_channel.label().await {
                 Ok(name) if name == "voice-screen-jpeg-v1" => start_screen_channel(
                     me.peer, data_channel, me.events, me.screen_frames.subscribe(),
+                ),
+                Ok(name) if name == "voice-screen-system-audio-v1" => start_system_audio_channel(
+                    me.peer, data_channel, me.events, me.system_audio.subscribe(), me.playback,
                 ),
                 Ok(name) if name == "voice-screen-test" => start_media_channel(
                     me.peer, data_channel, me.events,
@@ -253,6 +257,94 @@ fn start_media_channel(
     });
 }
 
+// O som do computador usa um canal separado (Opus mono 48 kHz / 20 ms).
+// Um decoder e uma fila diferentes da voz impedem colisao de sequencia/ganho.
+fn start_system_audio_channel(
+    peer: String,
+    channel: Arc<dyn DataChannel>,
+    events: mpsc::UnboundedSender<MeshEvent>,
+    mut outgoing: broadcast::Receiver<Vec<u8>>,
+    playback: PlaybackBus,
+) {
+    tokio::spawn(async move {
+        let short = peer[..peer.len().min(8)].to_owned();
+        let bus_key = format!("__screen_audio__{peer}");
+        let mut decoder = match PeerDecoder::new() {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = events.send(MeshEvent::Status(format!("Decoder do som da tela falhou: {e}")));
+                return;
+            }
+        };
+        let mut opened = false;
+        let mut reported = false;
+        let mut packet_count = 0u64;
+        loop {
+            tokio::select! {
+                received = channel.poll() => {
+                    match received {
+                        Some(DataChannelEvent::OnOpen) => {
+                            opened = true;
+                            let _ = events.send(MeshEvent::Status(format!("Canal de som da tela pronto: {short}")));
+                        }
+                        Some(DataChannelEvent::OnMessage(packet)) => {
+                            let data = packet.data.as_ref();
+                            if data.len() > 8 && data.starts_with(b"VSD1") {
+                                // PeerDecoder trabalha com o mesmo envelope do Opus do microfone;
+                                // cabeçalho alterado apenas na memoria, nunca no fluxo de rede.
+                                let mut adapted = data.to_vec();
+                                adapted[..4].copy_from_slice(b"VSA1");
+                                match decoder.decode(&adapted, &playback, &bus_key) {
+                                    Ok(Some(_)) => {
+                                        packet_count += 1;
+                                        if packet_count == 1 {
+                                            let _ = events.send(MeshEvent::Status(format!(
+                                                "Som da tela RECEBIDO de {short}"
+                                            )));
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        if !reported {
+                                            reported = true;
+                                            let _ = events.send(MeshEvent::Status(format!(
+                                                "Erro decodificando som da tela {short}: {e}"
+                                            )));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Some(DataChannelEvent::OnClose) | None => break,
+                        _ => {}
+                    }
+                }
+                packet = outgoing.recv(), if opened => {
+                    match packet {
+                        Ok(data) => {
+                            // Se houve congestionamento, preferir o quadro mais novo.
+                            match channel.try_send(BytesMut::from(data.as_slice())).await {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    if !reported {
+                                        reported = true;
+                                        let _ = events.send(MeshEvent::Status(format!(
+                                            "Som da tela congestionado para {short}: {e}"
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+        playback.remove(&bus_key);
+    });
+}
+
 // Canal de tela separado do canal Opus: imagens atrasadas sao descartadas.
 fn start_screen_channel(
     peer: String,
@@ -339,6 +431,7 @@ pub struct Mesh {
     ice_servers: Mutex<Vec<RTCIceServer>>,
     voice: broadcast::Sender<Vec<u8>>,
     screen_frames: broadcast::Sender<Vec<u8>>,
+    system_audio: broadcast::Sender<Vec<u8>>,
     playback: PlaybackBus,
 }
 
@@ -348,11 +441,12 @@ impl Mesh {
         events: mpsc::UnboundedSender<MeshEvent>,
         voice: broadcast::Sender<Vec<u8>>,
         screen_frames: broadcast::Sender<Vec<u8>>,
+        system_audio: broadcast::Sender<Vec<u8>>,
         playback: PlaybackBus,
     ) -> Self {
         Self {
             links: Mutex::new(HashMap::new()),
-            early_ice: Mutex::new(HashMap::new()), signaling, events, voice, screen_frames, playback,
+            early_ice: Mutex::new(HashMap::new()), signaling, events, voice, screen_frames, system_audio, playback,
             ice_servers: Mutex::new(vec![RTCIceServer {
                 urls: vec!["stun:stun.l.google.com:19302".to_owned()],
                 ..Default::default()
@@ -392,7 +486,8 @@ impl Mesh {
         let config = builder.build();
         let handler = Handler {
             peer: peer.to_owned(), events: self.events.clone(), signaling: self.signaling.clone(),
-            voice: self.voice.clone(), screen_frames: self.screen_frames.clone(), playback: self.playback.clone(),
+            voice: self.voice.clone(), screen_frames: self.screen_frames.clone(),
+            system_audio: self.system_audio.clone(), playback: self.playback.clone(),
         };
         let pc: Arc<dyn PeerConnection> = Arc::new(
             PeerConnectionBuilder::new()
@@ -484,6 +579,13 @@ impl Mesh {
             ..Default::default()
         })).await?;
         start_screen_channel(peer.to_owned(), screen_channel, self.events.clone(), self.screen_frames.subscribe());
+        let system_audio_channel = pc.create_data_channel("voice-screen-system-audio-v1", Some(RTCDataChannelInit {
+            ordered: false,
+            max_packet_life_time: Some(160),
+            ..Default::default()
+        })).await?;
+        start_system_audio_channel(peer.to_owned(), system_audio_channel, self.events.clone(),
+            self.system_audio.subscribe(), self.playback.clone());
         self.emit(format!("DataChannel P2P criado para {}; gerando oferta", &peer[..peer.len().min(8)]));
         let offer = pc.create_offer(None).await?;
         pc.set_local_description(offer).await?;
